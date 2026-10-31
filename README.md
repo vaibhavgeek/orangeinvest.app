@@ -28,8 +28,15 @@ Other things to try: `Move my AC servicing to Saturday`, `Book the same electric
 In `crash_after_book` the process dies right after the provider accepts the booking. Run the same command again
 without `--fresh` and the agent reconciles on start.
 
-`--llm` switches parsing to Anthropic (needs `ANTHROPIC_API_KEY`). This is optional. The default parser is
-deterministic and is the one the evals use.
+`--llm` switches parsing to OpenAI (`gpt-6.1-terra` by default; override with `OPENAI_MODEL=gpt-6.1-sol`).
+The key is read from `OPENAI_API_KEY` or a gitignored `.env` file (`OPENAI_API_KEY=sk-...`). `--llm anthropic`
+uses `ANTHROPIC_API_KEY`. With the helper script: `LLM=openai ./try_it.sh chat`.
+
+The LLM only fills the same typed `Parsed` record the rule parser produces. Unknown fields such as
+`"approved": true` are dropped, and approval is still decided by code from the raw text, never by the model. Calendar dates are
+resolved by code when it recognises the phrase, because the model got "tomorrow" wrong in testing. Any API or
+JSON error falls back to the rule parser, and the trace records `fallback_reason`. The default parser is
+deterministic and is the one the evals use, so `pytest` never calls the network.
 
 ## Layout
 
@@ -39,7 +46,7 @@ deterministic and is the one the evals use.
 | `errand_agent/tools.py` | `ToolGateway`: budget, tracing, sanitising, and the **approval check on every mutating call** |
 | `errand_agent/agent.py` | The state machine: collect → choose → approve → execute → verify |
 | `errand_agent/approval.py` | Approval records, fingerprints, strict yes/no detection |
-| `errand_agent/nlu.py` | Rule-based parser (default), `ScriptedModel` for evals, optional `LLMModel` |
+| `errand_agent/nlu.py` | Rule-based parser (default), `ScriptedModel` for evals, optional `OpenAIModel` and `LLMModel` (Anthropic) |
 | `errand_agent/memory.py` | Persistent preferences marked stated/inferred, with confirm and forget |
 | `errand_agent/state.py`, `trace.py`, `budget.py` | Persisted workflow state, JSONL traces, hard limits |
 | `tests/test_evals.py` | 28 scripted scenarios with invariant checks → `docs/EVAL_RESULTS.md` |

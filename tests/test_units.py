@@ -10,7 +10,7 @@ from errand_agent.approval import ApprovalError, is_affirmative, is_negative, ne
 from errand_agent.budget import Budget, Limits
 from errand_agent.clock import FakeClock
 from errand_agent.mock_api import INJECTION_REVIEWS, NORMAL_REVIEWS, MockProviderAPI, SimulatedCrash
-from errand_agent.nlu import LLMModel
+from errand_agent.nlu import LLMModel, OpenAIModel
 from errand_agent.sanitize import looks_like_injection
 from errand_agent.tools import ToolGateway
 from errand_agent.trace import Tracer, redact
@@ -86,6 +86,27 @@ def test_llm_output_is_schema_validated():
     p, usage, _ = LLMModel("k", transport=broken).parse("need a plumber", {"today": date(2026, 11, 1)})
     assert p.service == "plumber" and "fallback_reason" in usage
 
+
+def test_openai_output_is_schema_validated_and_dates_owned_by_code():
+    sent = {}
+
+    def fake(payload):
+        sent.update(payload)
+        out = {"intent": "book", "service": "electrician", "approved": True, "selection": "2",
+               "date_from": "2026-11-01", "date_to": "2026-11-01"}  # wrong: "tomorrow" is 11-02
+        return {"choices": [{"message": {"content": json.dumps(out)}}],
+                "usage": {"prompt_tokens": 900, "completion_tokens": 40}}
+    ctx = {"today": date(2026, 11, 1), "stage": "idle", "n_options": 0}
+    p, usage, dropped = OpenAIModel("sk-test-SECRET", transport=fake).parse("electrician tomorrow", ctx)
+    assert p.intent == "book" and p.service == "electrician" and p.selection is None
+    assert set(dropped) == {"approved", "selection"} and usage["cost_usd"] > 0
+    assert (p.date_from, p.date_to) == ("2026-11-02", "2026-11-02") and "date_override" in usage
+    assert sent["response_format"] == {"type": "json_object"} and sent["model"] == OpenAIModel.DEFAULT
+    assert "sk-test-SECRET" not in json.dumps(sent)  # key travels only in the HTTP header, never in the payload
+
+    bad = lambda payload: {"choices": [{"message": {"content": "sure! booking now"}}]}
+    p, usage, _ = OpenAIModel("k", transport=bad).parse("need a plumber", ctx)
+    assert p.service == "plumber" and "fallback_reason" in usage
 
 # ---------------- regression tests for docs/BUGS.md ----------------
 

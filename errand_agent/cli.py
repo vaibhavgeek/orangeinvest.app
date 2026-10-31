@@ -21,6 +21,18 @@ SCENARIOS = {
 }
 
 
+def load_dotenv(path=".env"):
+    """Minimal .env loader (KEY=VALUE lines). Existing environment variables win."""
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenario", default="default", choices=sorted(SCENARIOS))
@@ -29,8 +41,11 @@ def main(argv=None):
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--trace-dir", default="traces")
     ap.add_argument("--fresh", action="store_true", help="wipe saved sessions, memory, provider world and traces")
-    ap.add_argument("--llm", action="store_true", help="use Anthropic for parsing (needs ANTHROPIC_API_KEY)")
+    ap.add_argument("--llm", nargs="?", const="openai", choices=["openai", "anthropic"],
+                    help="parse with an LLM instead of the rule-based parser (default: openai; key from "
+                         "OPENAI_API_KEY / ANTHROPIC_API_KEY or .env; model from OPENAI_MODEL)")
     a = ap.parse_args(argv)
+    load_dotenv()
 
     if a.fresh:
         shutil.rmtree(a.data_dir, ignore_errors=True)
@@ -41,8 +56,12 @@ def main(argv=None):
 
     model = None
     if a.llm:
-        from .nlu import LLMModel
-        model = LLMModel(os.environ["ANTHROPIC_API_KEY"])
+        from .nlu import LLMModel, OpenAIModel
+        env = "OPENAI_API_KEY" if a.llm == "openai" else "ANTHROPIC_API_KEY"
+        if not os.environ.get(env):
+            sys.exit(f"--llm {a.llm} needs {env} (set it in the environment or in .env)")
+        model = (OpenAIModel(os.environ[env], os.environ.get("OPENAI_MODEL")) if a.llm == "openai"
+                 else LLMModel(os.environ[env]))
     world = os.path.join(a.data_dir, "mock_world.json")
     scenario = Scenario(**SCENARIOS[a.scenario])
     if os.path.exists(world):
@@ -51,7 +70,8 @@ def main(argv=None):
     api = MockProviderAPI(clock=clock, scenario=scenario, user_id=a.user, path=world)
     agent = Agent(api, user_id=a.user, session_id=a.session, data_dir=a.data_dir, model=model, clock=clock,
                   limits=Limits(), trace_dir=a.trace_dir)
-    print(f"Errand agent — scenario '{a.scenario}', user {a.user}. Type 'quit' to exit.")
+    parser = model.name if model else "rule-based"
+    print(f"Errand agent — scenario '{a.scenario}', user {a.user}, parser {parser}. Type 'quit' to exit.")
     try:
         note = agent.resume()
         if note:

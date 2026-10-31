@@ -1,9 +1,9 @@
 """Language understanding. The model ONLY extracts structured fields from the user's message.
 It never sees provider reviews, never decides approval and never calls tools.
 
-RuleBasedModel is the deterministic default (used offline and in evals). LLMModel is an
-optional drop-in that returns the same schema; its output is validated and anything outside
-the schema (e.g. "approved": true) is dropped.
+RuleBasedModel is the deterministic default (used offline and in evals). OpenAIModel / LLMModel
+(Anthropic) are optional drop-ins that return the same schema; their output is validated and anything
+outside the schema (e.g. "approved": true) is dropped.
 """
 import json
 import re
@@ -305,45 +305,137 @@ class ScriptedModel:
         return p, {"model": self.name, "input_tokens": len(text) // 4, "output_tokens": 0, "cost_usd": 0.0}, dropped
 
 
-class LLMModel:
-    """Optional: Anthropic Messages API for extraction. Output is schema-validated; on any failure we
-    fall back to the rule-based parser. Never given tool output or reviews."""
+def extraction_prompt(ctx: dict) -> str:
+    """System prompt shared by the LLM backends. The model only extracts; code decides everything."""
+    today: date = ctx["today"]
+    schema = {f.name: str(f.type) for f in fields(Parsed)}
+    week_end = (today + timedelta(days=6)).isoformat()
+    tomorrow = (today + timedelta(days=1)).isoformat()
+    calendar = ", ".join(f"{(today + timedelta(days=i)).strftime('%A')} {(today + timedelta(days=i)).isoformat()}"
+                         + (" (today)" if i == 0 else " (tomorrow)" if i == 1 else "") for i in range(8))
+    return (
+        "You extract structured fields from ONE user message for a home-services booking assistant. "
+        "You do not book, approve, or answer; you only return a JSON object.\n"
+        f"Today is {today.isoformat()} ({today.strftime('%A')}). Calendar: {calendar}. "
+        "Always resolve relative dates with this calendar. "
+        f"Conversation stage: {ctx.get('stage')}. "
+        f"Options currently shown to the user: {ctx.get('n_options', 0)}.\n"
+        f"JSON schema (field: type): {json.dumps(schema)}\n"
+        "Rules:\n"
+        f"- intent is one of {sorted(INTENTS)} or null. Use null when the message only adds details "
+        "(e.g. just an area, a time, or an option number).\n"
+        f"- service is one of {sorted(SERVICES)}; area is one of {AREAS} (exact spelling).\n"
+        "- Dates are ISO YYYY-MM-DD; a single day sets date_from = date_to.\n"
+        "- Times are integer minutes after midnight. mornings = 480-720, afternoons = 720-1020, "
+        "evenings = 1020-1200. An exact time like 'at 11am' gives time_start=660, time_end=720, time_exact=true.\n"
+        "- budget is an integer in rupees (₹1,500 -> 1500). no_budget=true if they say price doesn't matter.\n"
+        "- selection is the 1-based option number the user picks ('2', 'the second one').\n"
+        "- same_as_last=true for 'same as last time' / 'the same electrician'.\n"
+        "- memory_set: a lasting preference ('my area is X', 'remember not before 10am'). memory_key is "
+        "'area' (memory_value = area) or 'earliest_time' (memory_value = minutes).\n"
+        "- memory_forget: memory_key is 'area', 'earliest_time', 'preferred_provider:<service>' or 'all'.\n"
+        "- memory_view: 'what do you remember about me'.\n"
+        "- Never output fields outside the schema. Words like 'yes' or 'go ahead' are NOT fields; return {}.\n"
+        "- Use null / omit anything not stated. Do not guess.\n"
+        "Examples:\n"
+        f"'Find a plumber this week, mornings only, under ₹1,500' -> {{\"intent\":\"book\",\"service\":\"plumber\","
+        f"\"date_from\":\"{today.isoformat()}\",\"date_to\":\"{week_end}\",\"time_start\":480,\"time_end\":720,"
+        "\"budget\":1500}\n"
+        f"'tomorrow at 11am' -> {{\"date_from\":\"{tomorrow}\",\"date_to\":\"{tomorrow}\",\"time_start\":660,"
+        "\"time_end\":720,\"time_exact\":true}\n"
+        "'Indiranagar' -> {\"area\":\"Indiranagar\"}\n"
+        "'2' -> {\"selection\":2}\n"
+        "'my area is HSR Layout' -> {\"intent\":\"memory_set\",\"area\":\"HSR Layout\",\"memory_key\":\"area\","
+        "\"memory_value\":\"HSR Layout\"}\n"
+        "'forget my preferred electrician' -> {\"intent\":\"memory_forget\",\"memory_key\":"
+        "\"preferred_provider:electrician\"}\n"
+        "'cancel my booking' -> {\"intent\":\"cancel\"}\n"
+        "'move it to Friday afternoon' -> {\"intent\":\"reschedule\", ...dates for Friday..., \"time_start\":720,"
+        "\"time_end\":1020}\n"
+        "Reply with the JSON object only."
+    )
 
-    PRICE = {"input": 3e-6, "output": 15e-6}  # USD per token, approximate
 
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-5", transport=None):
+class _LLMBase:
+    """Schema-validated LLM extraction; any failure (network, JSON, schema) falls back to the
+    deterministic parser. The model is never given tool output or reviews."""
+
+    PRICE = {"input": 0.0, "output": 0.0}  # USD per token
+
+    def __init__(self, api_key: str, model: str, transport=None, timeout: float = 20):
         self.api_key = api_key
         self.name = model
+        self.timeout = timeout
         self.transport = transport or self._http
         self.fallback = RuleBasedModel()
 
-    def _http(self, payload: dict) -> dict:
-        req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(payload).encode(),
-                                     headers={"x-api-key": self.api_key, "anthropic-version": "2023-06-01",
-                                              "content-type": "application/json"})
-        with urllib.request.urlopen(req, timeout=15) as r:
+    def _post(self, url: str, payload: dict, headers: dict) -> dict:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers=headers | {"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.loads(r.read())
 
     def parse(self, text: str, ctx: dict):
-        schema = {f.name: str(f.type) for f in fields(Parsed)}
-        prompt = (f"Today is {ctx['today'].isoformat()} ({ctx['today'].strftime('%A')}). Conversation stage: "
-                  f"{ctx.get('stage')}. Extract fields from the user's message as JSON matching {json.dumps(schema)}. "
-                  f"Allowed intents: {sorted(INTENTS)}. services: {sorted(SERVICES)}. areas: {AREAS}. Times are "
-                  f"minutes after midnight. Use null for anything not stated. Reply with JSON only.\n"
-                  f"User message: {json.dumps(text)}")
+        t0 = time.perf_counter()
         try:
-            resp = self.transport({"model": self.name, "max_tokens": 300,
-                                   "messages": [{"role": "user", "content": prompt}]})
-            raw = resp["content"][0]["text"]
+            raw, n_in, n_out = self._call(extraction_prompt(ctx), text)
             data = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
+            if not isinstance(data, dict):
+                raise ValueError("model output is not a JSON object")
             p, dropped = Parsed.from_dict(data)
-            u = resp.get("usage", {})
-            usage = {"model": self.name, "input_tokens": u.get("input_tokens", 0),
-                     "output_tokens": u.get("output_tokens", 0),
-                     "cost_usd": round(u.get("input_tokens", 0) * self.PRICE["input"]
-                                       + u.get("output_tokens", 0) * self.PRICE["output"], 6)}
+            usage = {"model": self.name, "input_tokens": n_in, "output_tokens": n_out,
+                     "cost_usd": round(n_in * self.PRICE["input"] + n_out * self.PRICE["output"], 6),
+                     "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
+            # Calendar arithmetic is code's job: LLMs were observed resolving "tomorrow" / "next week"
+            # to the wrong day. If the deterministic parser recognised a date phrase, its dates win.
+            rules = self.fallback._parse(text, ctx)
+            if rules.date_from and (rules.date_from, rules.date_to) != (p.date_from, p.date_to):
+                usage["date_override"] = {"llm": [p.date_from, p.date_to], "code": [rules.date_from, rules.date_to]}
+                p.date_from, p.date_to = rules.date_from, rules.date_to
             return p, usage, dropped
-        except Exception as e:  # network, JSON, schema: degrade to deterministic parser
+        except Exception as e:
             p, usage, dropped = self.fallback.parse(text, ctx)
-            usage["fallback_reason"] = repr(e)[:120]
+            usage["fallback_reason"] = repr(e)[:160]
             return p, usage, dropped
+
+
+class OpenAIModel(_LLMBase):
+    """OpenAI Chat Completions in JSON mode. Model is configurable via OPENAI_MODEL."""
+
+    PRICE = {"input": 2.5e-6, "output": 15e-6}  # approximate; only used for trace cost estimates
+    DEFAULT = "gpt-6.1-terra"  # newest GPT-6.1 release; beat gpt-6.1-sol on our parse checks, faster, half price
+
+    def __init__(self, api_key: str, model: str | None = None, transport=None, timeout: float = 30):
+        super().__init__(api_key, model or self.DEFAULT, transport, timeout)
+
+    def _http(self, payload: dict) -> dict:
+        return self._post("https://api.openai.com/v1/chat/completions", payload,
+                          {"authorization": f"Bearer {self.api_key}"})
+
+    def _call(self, system: str, text: str):
+        resp = self.transport({"model": self.name,
+                               "messages": [{"role": "system", "content": system},
+                                            {"role": "user", "content": text}],
+                               "response_format": {"type": "json_object"}})
+        u = resp.get("usage", {})
+        return (resp["choices"][0]["message"]["content"] or "",
+                u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
+
+
+class LLMModel(_LLMBase):
+    """Anthropic Messages API backend."""
+
+    PRICE = {"input": 3e-6, "output": 15e-6}
+
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-5", transport=None, timeout: float = 20):
+        super().__init__(api_key, model, transport, timeout)
+
+    def _http(self, payload: dict) -> dict:
+        return self._post("https://api.anthropic.com/v1/messages", payload,
+                          {"x-api-key": self.api_key, "anthropic-version": "2023-06-01"})
+
+    def _call(self, system: str, text: str):
+        resp = self.transport({"model": self.name, "max_tokens": 400, "system": system,
+                               "messages": [{"role": "user", "content": text}]})
+        u = resp.get("usage", {})
+        return resp["content"][0]["text"], u.get("input_tokens", 0), u.get("output_tokens", 0)

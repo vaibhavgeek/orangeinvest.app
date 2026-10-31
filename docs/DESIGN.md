@@ -93,5 +93,5 @@ summary, error, latency), `approval` (created/granted/voided/consumed with finge
 3. **Synchronous provider calls inside the chat turn.** Slow providers use up the 30 s turn budget. Execution should move to a job
    queue with per-provider rate limits and circuit breakers, with the chat streaming status updates.
 4. **The rule-based parser's coverage** (phrasings, areas, Hindi/Hinglish). I'd put an LLM extractor behind the same
-   `Parsed` schema (the `LLMModel` adapter is there) and grow a recorded-conversation eval set to measure it. The rules stay as a fallback.
+   `Parsed` schema (`OpenAIModel` and `LLMModel` adapters exist; `--llm` turns on OpenAI) and grow a recorded-conversation eval set to measure it. The rules stay as a fallback.
 5. **Traces as local files.** I'd ship them to OpenTelemetry with sampling, and alert on `approval_blocked`, `recovery` and limit exits.
