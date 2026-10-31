@@ -1,5 +1,6 @@
 """The errand agent: an explicit state machine. The model only parses text; this code decides."""
 import os
+import re
 import uuid
 from datetime import datetime, timedelta
 
@@ -14,6 +15,10 @@ from .tools import ToolGateway
 
 SERVICE_NAMES = {"plumber": "plumber", "electrician": "electrician", "ac_service": "AC servicing",
                  "cleaning": "home cleaning", "carpenter": "carpenter", "pest_control": "pest control"}
+
+
+LEAD_MINUTES = 60          # earliest bookable slot is this far from now
+MAX_MESSAGE_CHARS = 1000   # longer messages are refused before any (paid) model call
 
 
 def fmt_slot(slot: str) -> str:
@@ -146,10 +151,26 @@ class Agent:
             msg = self._reconcile()
             return msg
 
+        if len(text) > MAX_MESSAGE_CHARS:
+            self.tracer.event("input_rejected", reason="too_long", chars=len(text))
+            return (f"That message is too long ({len(text)} characters; the limit is {MAX_MESSAGE_CHARS}). "
+                    "Please send a shorter request. Nothing was changed.")
+
+        several = RuleBasedModel.errands(text)
+        if len(several) > 1:
+            self.tracer.event("input_rejected", reason="several_errands", errands=several)
+            return (f"That's more than one errand ({' and '.join(several)}). I handle one at a time so each gets its "
+                    "own confirmation. Which should I do first? Nothing was changed.")
+
         p = self._parse(text)
 
         if p.intent in ("memory_view", "memory_forget", "memory_set"):
             return self._memory_op(p)
+
+        if p.area is None and re.search(r"\b(my area is|i live in|i (have |'ve )?moved to|my address is)\b",
+                                        text.lower()):
+            return (f"I can only book in these areas: {', '.join(AREAS)}. I haven't saved anything. "
+                    "Tell me one of those if it's right for you.")
 
         if S.get("pending_memory"):
             pm, S["pending_memory"] = S["pending_memory"], None
@@ -200,6 +221,12 @@ class Agent:
             return ("I can book, reschedule or cancel home services, e.g. 'Find a plumber in Indiranagar this "
                     "week under ₹1,500', 'Move my AC servicing to Saturday' or 'Cancel my plumber booking'. "
                     "I can also show or forget what I remember about you.")
+
+        if S["stage"] in ("choosing", "collecting") and is_negative(text) and not updates and p.selection is None:
+            self._void("user stopped")
+            S.update({"intent": None, "request": {}, "options": [], "hold": None, "target": None, "approval": None})
+            self._transition("idle", "user stopped the request")
+            return "OK, I've dropped that request. Nothing was booked or changed."
 
         if updates:
             self._merge(updates)
@@ -334,7 +361,27 @@ class Agent:
             if S["stage"] != "collecting":
                 self._transition("collecting", "missing details")
             return " ".join(notes + ["To find options I still need: " + "; ".join(missing) + "."])
+        past = self._past_dates()
+        if past:
+            return " ".join(notes + [past])
         return " ".join(notes + [self._search_and_present()]).strip()
+
+    def _bookable(self, slot: str) -> bool:
+        """Providers need lead time; the mock (like many real APIs) will happily list slots in the past."""
+        return datetime.fromisoformat(slot) >= self.clock.now() + timedelta(minutes=LEAD_MINUTES)
+
+    def _past_dates(self) -> str | None:
+        """Clamp a range that started in the past; reject one that ended in the past."""
+        r = self.state["request"]
+        today = self.clock.now().date().isoformat()
+        if r.get("date_to") and r["date_to"] < today:
+            when = r["date_from"] if r["date_from"] == r["date_to"] else f"{r['date_from']} to {r['date_to']}"
+            r.pop("date_from"); r.pop("date_to")
+            self._transition("collecting", "date in the past")
+            return f"{when} is in the past. When would you like it instead (e.g. 'tomorrow', 'this week')?"
+        if r.get("date_from") and r["date_from"] < today:
+            r["date_from"] = today
+        return None
 
     def _window(self):
         r = self.state["request"]
@@ -357,7 +404,7 @@ class Agent:
             if r.get("budget") and p["price"] > r["budget"]:
                 continue
             slots = [s for s in p["free_slots"]
-                     if start <= datetime.fromisoformat(s).hour * 60 < end and s not in mine
+                     if start <= datetime.fromisoformat(s).hour * 60 < end and s not in mine and self._bookable(s)
                      and f"{p['id']}|{s}" not in excluded]
             if slots:
                 cands.append((p, slots))
@@ -586,6 +633,9 @@ class Agent:
         if not r.get("date_from"):
             self._transition("collecting", "need new date")
             return f"When would you like to move your {SERVICE_NAMES[t['service']]} ({fmt_slot(t['slot'])}) to?"
+        past = self._past_dates()
+        if past:
+            return past
         areas = [a for a in [t.get("area"), r.get("area"), self.memory.usable("area")] if a] + AREAS
         free = None
         for area in dict.fromkeys(areas):
@@ -598,7 +648,7 @@ class Agent:
         start, end = self._window()
         excluded = set(r.get("excluded", []))
         slots = [s for s in (free or []) if start <= datetime.fromisoformat(s).hour * 60 < end
-                 and s != t["slot"] and f"{t['provider_id']}|{s}" not in excluded]
+                 and s != t["slot"] and f"{t['provider_id']}|{s}" not in excluded and self._bookable(s)]
         if not slots:
             self._transition("collecting", "no reschedule slots")
             return (f"{t['provider_name']} has no free slots between {r['date_from']} and {r['date_to']}"

@@ -41,7 +41,10 @@ def require(ap: dict | None, action: str, provider_id: str | None = None, slot: 
 _AFFIRM_START = {"yes", "y", "yep", "yeah", "yup", "confirm", "confirmed", "ok", "okay", "sure",
                  "go", "do", "book", "please", "correct", "approve", "approved"}
 _AFFIRM_PHRASES = {"go ahead", "do it", "book it", "please do", "sounds good", "yes please", "confirm it"}
-_HEDGES = {"not", "don't", "dont", "no", "wait", "but", "actually", "change", "instead", "hmm", "maybe", "later"}
+_HEDGES = {"not", "don't", "dont", "no", "wait", "but", "actually", "change", "instead", "hmm", "maybe", "later",
+           # instruction-like words: a confirmation that also tries to steer the agent is not a clear yes
+           "ignore", "rules", "rule", "system", "instructions", "instruction", "override", "bypass", "skip",
+           "previous", "admin", "developer", "prompt", "pretend"}
 _NEG_START = {"no", "nope", "nah", "stop", "don't", "dont", "never"}
 
 

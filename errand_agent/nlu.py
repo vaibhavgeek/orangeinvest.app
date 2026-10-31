@@ -185,6 +185,18 @@ class RuleBasedModel:
         return p
 
     @staticmethod
+    def errands(text: str) -> list[str]:
+        """Distinct errands named in one message (e.g. 'book a plumber and cancel my AC'). Explicit words only."""
+        t = text.lower()
+        nouns = [svc for svc, pat in [("plumber", r"\bplumb"), ("electrician", r"\belectric"),
+                                      ("AC servicing", r"\b(ac|a/c|air ?con\w*)\b"), ("pest control", r"\bpest"),
+                                      ("cleaning", r"\bclean(ing|er)"), ("carpenter", r"\bcarpent")]
+                 if re.search(pat, t)]
+        acts = [a for a, pat in [("book", r"\b(book|find)\b"), ("cancel", r"\bcancel\b"),
+                                 ("reschedule", r"\b(reschedule|postpone)\b")] if re.search(pat, t)]
+        return nouns if len(nouns) > 1 else (acts if len(acts) > 1 else [])
+
+    @staticmethod
     def _service(t: str) -> str | None:
         best = None
         for svc, pat in SERVICE_WORDS:
@@ -211,6 +223,8 @@ class RuleBasedModel:
             p.date_from, p.date_to = a.isoformat(), b.isoformat()
         if re.search(r"\bday after tomorrow\b", t):
             d = today + timedelta(days=2); rng(d, d); return
+        if re.search(r"\byesterday\b", t):
+            d = today - timedelta(days=1); rng(d, d); return
         if re.search(r"\btoday\b", t):
             rng(today, today); return
         if re.search(r"\btomorrow\b", t):
@@ -233,7 +247,7 @@ class RuleBasedModel:
             day, mon = (int(a), b) if a.isdigit() else (int(b), a)
             try:
                 d = date(today.year, MONTHS.index(mon[:3]) + 1, day)
-                if d < today:
+                if (today - d).days > 60:  # "5 jan" said in November means next year; "15 oct" is just past
                     d = date(today.year + 1, d.month, d.day)
                 rng(d, d); return
             except ValueError:
@@ -281,11 +295,14 @@ class RuleBasedModel:
                      r"no max|whatever it costs|no price limit", t):
             p.no_budget = True
             return
+        amount = r"([\d,]{3,}|\d+(?:\.\d+)?\s*k\b)"
         m = re.search(r"(?:under|below|less than|within|max(?:imum)?|budget(?: of| is)?|up ?to|"
-                      r"no more than|upto)\s*(?:₹|rs\.?|inr)?\s*([\d,]{3,})", t) or \
-            re.search(r"(?:₹|\brs\.?\s*|\binr\s*)([\d,]{3,})", t)
+                      r"no more than|upto)\s*(?:₹|rs\.?|inr)?\s*" + amount, t) or \
+            re.search(r"(?:₹|\brs\.?\s*|\binr\s*)" + amount, t) or \
+            re.search(r"\b" + amount + r"\s*(?:rupees|rs\b|inr\b|/-|max\b|maximum\b|tops\b)", t)
         if m:
-            v = int(m.group(1).replace(",", ""))
+            raw = m.group(1).replace(",", "").replace(" ", "")
+            v = int(round(float(raw[:-1]) * 1000)) if raw.endswith("k") else int(raw)
             if v >= 100:
                 p.budget = v
 

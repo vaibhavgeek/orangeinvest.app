@@ -3,6 +3,7 @@
 #   ./try_it.sh                 run the tests, open the eval table, then open chat + live trace windows
 #   ./try_it.sh test            only run the tests and open the eval table
 #   ./try_it.sh chat [SCENARIO] only open chat + live trace (default scenario: timeout_after_success)
+#   ./try_it.sh web             web UI with chat, trace, state, memory and red-team playbooks (http://127.0.0.1:8000)
 #   LLM=openai ./try_it.sh chat  parse with OpenAI (key from .env OPENAI_API_KEY; model OPENAI_MODEL, default gpt-6.1-terra)
 # Scenarios: default timeout_after_success timeout_not_booked slot_taken price_change crash_after_book
 set -euo pipefail
@@ -40,9 +41,16 @@ EOF
   fi
 }
 
+run_web() {
+  echo "▶ Web UI on http://127.0.0.1:8000  (Ctrl+C to stop)"
+  [[ "$(uname)" == "Darwin" ]] && (sleep 1 && open "http://127.0.0.1:8000") &
+  "$PY" -m errand_agent.web $LLM_FLAG
+}
+
 case "$MODE" in
   test) run_tests ;;
   chat) run_chat ;;
+  web)  run_web ;;
   all)  run_tests; run_chat ;;
-  *) echo "usage: $0 [all|test|chat [scenario]]"; exit 1 ;;
+  *) echo "usage: $0 [all|test|chat [scenario]|web]"; exit 1 ;;
 esac
