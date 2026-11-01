@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type Approval, type Playbook, type Reply, type Snapshot, type TraceEvent } from "./api";
 import {
-  type Active, BookingsPane, expandSteps, expectText, MemoryPane, PlaybooksPane, StatePane, TracePane, verdict,
+  type Active, BookingsPane, expandSteps, expectText, MemoryPane, PlaybooksPane, ProfilePane, StatePane, TracePane, verdict,
 } from "./panels";
+import MessageBody, { hasOptions } from "./Message";
 
 type Msg = { id: number; kind: "user" | "agent" | "system"; text: string };
 type Tab = "trace" | "memory" | "bookings" | "state" | "playbooks";
 const DEV = new URLSearchParams(window.location.search).get("dev") === "1";
 const TABS: Tab[] = DEV ? ["trace", "memory", "bookings", "state", "playbooks"] : ["trace", "memory", "bookings"];
 const TAB_LABELS: Record<Tab, string> = { trace: "Trace", memory: "Memory", bookings: "Bookings", state: "State", playbooks: "Playbooks" };
-const PARSER_LABELS: Record<string, string> = { rules: "Rule-based (offline)", openai: "OpenAI", anthropic: "Anthropic" };
 const MAX_CHARS = 1000;
 const EXAMPLES = [
   "Find a plumber in Indiranagar this week, mornings, under ₹1,500",
@@ -18,16 +18,27 @@ const EXAMPLES = [
 ];
 
 let msgId = 0;
-const fmtSlot = (s: string) =>
-  new Date(s).toLocaleString("en-IN", { weekday: "short", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+const fmtDay = (s: string) =>
+  new Date(s).toLocaleDateString("en-IN", { weekday: "short", day: "2-digit", month: "short", year: "numeric" });
+const fmtTime = (s: string) =>
+  new Date(s).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: true });
 
-function ApprovalCard({ ap, busy, onYes, onNo }: { ap: Approval; busy: boolean; onYes: () => void; onNo: () => void }) {
+const SERVICE_LABELS: Record<string, string> = {
+  plumber: "Plumber", electrician: "Electrician", ac_service: "AC servicing", cleaning: "Home cleaning",
+  carpenter: "Carpenter", pest_control: "Pest control",
+};
+
+function ApprovalCard({ ap, service, busy, onYes, onNo }: {
+  ap: Approval; service: string | null; busy: boolean; onYes: () => void; onNo: () => void;
+}) {
   return (
     <div className="apcard">
       <div className="aptitle">Please confirm</div>
       <div className="aprow"><span>Action</span><b>{ap.action[0].toUpperCase() + ap.action.slice(1)}</b></div>
+      {service && <div className="aprow"><span>Service</span><b>{SERVICE_LABELS[service] ?? service}</b></div>}
       <div className="aprow"><span>Provider</span><b>{ap.provider_name}</b></div>
-      <div className="aprow"><span>When</span><b>{fmtSlot(ap.slot)}</b></div>
+      <div className="aprow"><span>Date</span><b>{fmtDay(ap.slot)}</b></div>
+      <div className="aprow"><span>Time</span><b>{fmtTime(ap.slot)}</b></div>
       {ap.action !== "cancel" && <div className="aprow"><span>Price</span><b>₹{ap.price.toLocaleString("en-IN")}</b></div>}
       {ap.booking_id && <div className="aprow"><span>Booking</span><b>{ap.booking_id}</b></div>}
       <div className="apbtns">
@@ -43,13 +54,15 @@ export default function App() {
   const [events, setEvents] = useState<TraceEvent[]>([]);
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [busy, setBusy] = useState(false);
-  const [open, setOpen] = useState(false);
+  const [panel, setPanel] = useState<"profile" | "details" | null>(null);
+  const open = panel !== null;
+  const toggle = (p: "profile" | "details") => setPanel((x) => (x === p ? null : p));
   const [tab, setTab] = useState<Tab>(DEV ? "playbooks" : "trace");
   const [input, setInput] = useState("");
   const [toast, setToast] = useState<string | null>(null);
   const [playbooks, setPlaybooks] = useState<Playbook[]>([]);
   const [active, setActiveState] = useState<Active | null>(null);
-  const [form, setForm] = useState({ scenario: "default", parser: "openai", user: "u1", clock: "real" });
+  const [form, setForm] = useState({ scenario: "default", user: "u1", clock: "real" });
 
   const since = useRef(0);
   const generation = useRef(0); // bumps on every new session, so stale polls are discarded
@@ -96,9 +109,10 @@ export default function App() {
 
   useEffect(() => { chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight }); }, [msgs, busy, snap?.stage]);
 
-  async function send(text: string): Promise<string | null> {
+  async function send(text: string, shown?: string): Promise<string | null> {
     if (busyRef.current || !text.trim()) return null;
-    say("user", text.length > 400 ? `${text.slice(0, 400)}… (${text.length} chars)` : text);
+    const echo = shown ?? text;
+    say("user", echo.length > 400 ? `${echo.slice(0, 400)}… (${echo.length} chars)` : echo);
     setBusyBoth(true);
     let reply: string | null = null;
     try {
@@ -137,7 +151,7 @@ export default function App() {
     setEvents([]);
     setMsgs([]);
     setForm(cfg);
-    if (DEV) say("system", `New session · scenario “${cfg.scenario}” · parser ${cfg.parser} · user ${cfg.user}`
+    if (DEV) say("system", `New session · scenario “${cfg.scenario}” · user ${cfg.user}`
       + `${cfg.clock === "fixed" ? " · clock fixed at Sun 01 Nov 2026 08:00" : ""}.`);
     setBusyBoth(false);
     await refresh();
@@ -180,15 +194,26 @@ export default function App() {
     send(t);
   }
 
+  /** A clicked option goes to the agent as its number but is shown as what was picked. */
+  function pick(t: string) {
+    const label = /^\d+$/.test(t) ? snap?.option_labels?.[Number(t) - 1] : undefined;
+    return send(t, label);
+  }
+
   const pendingApproval = snap && !snap.crashed && snap.stage === "awaiting_approval" && snap.approval?.status === "pending"
     ? snap.approval : null;
-  const choices = snap && !snap.crashed && snap.stage === "choosing"
-    ? Array.from({ length: Math.min(snap.options, 9) }, (_, i) => String(i + 1)) : [];
+  const lastAgent = [...msgs].reverse().find((m) => m.kind === "agent");
+  const closed = !!snap?.closed;
+  const live = !!snap && !snap.crashed && !closed && !busy && ["choosing", "collecting"].includes(snap.stage);
+  // Tables and numbered lists have their own clickable options; anything else in "choosing" gets chips here.
+  const choices = snap && !snap.crashed && snap.stage === "choosing" && !(lastAgent && hasOptions(lastAgent.text))
+    ? Array.from({ length: Math.min(snap.options, 20) }, (_, i) => String(i + 1)) : [];
 
   return (
     <>
       <header>
         <h1>🧰 Errand Agent</h1>
+        <span className="city" title="The only city for now">📍 Bangalore</span>
         {DEV && <>
           <span className={"pill stage-" + (snap?.crashed ? "crashed" : snap?.stage ?? "idle")}>
             {snap?.crashed ? "💥 process dead" : snap?.stage ?? "…"}</span>
@@ -198,18 +223,15 @@ export default function App() {
               {(snap?.scenarios ?? [form.scenario]).map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
           </label>
-          <label>Parser
-            <select value={form.parser} onChange={(e) => setForm({ ...form, parser: e.target.value })}>
-              {(snap?.parsers ?? [form.parser]).map((p) => <option key={p} value={p}>{PARSER_LABELS[p] ?? p}</option>)}
-            </select>
-          </label>
           <label>User <input type="text" size={4} value={form.user} onChange={(e) => setForm({ ...form, user: e.target.value })} /></label>
           <button disabled={busy} onClick={() => control("/api/advance", { minutes: 15 })}>⏩ +15 min</button>
           <button className="danger" disabled={busy} onClick={() => control("/api/restart")}>💥 Restart process</button>
         </>}
         <span className="spacer" />
         <button disabled={busy} onClick={() => { setActive(null); newSession({ clock: "real" }); }}>New chat</button>
-        <button className={open ? "on" : ""} onClick={() => setOpen(!open)}>Details {open ? "▸" : "◂"}</button>
+        <button className={panel === "profile" ? "on" : ""} onClick={() => toggle("profile")}>Profile</button>
+        <button className={panel === "details" ? "on" : ""} onClick={() => toggle("details")}>
+          Details {panel === "details" ? "▸" : "◂"}</button>
       </header>
 
       <main className={open ? "with-drawer" : ""}>
@@ -226,29 +248,44 @@ export default function App() {
             )}
             {msgs.map((m) => (
               <div key={m.id} className={["msg", m.kind, m.kind === "agent" && m.text.includes("✅") ? "ok" : ""].join(" ")}>
-                {m.text}
+                {m.kind === "agent"
+                  ? <MessageBody text={m.text} live={live && m === lastAgent} suggestions={snap?.suggestions ?? []}
+                                 onPick={(t) => pick(t)} />
+                  : m.text}
               </div>
             ))}
             {busy && <div className="typing">…</div>}
             {pendingApproval && !busy &&
-              <ApprovalCard ap={pendingApproval} busy={busy} onYes={() => send("yes")} onNo={() => send("no")} />}
+              <ApprovalCard ap={pendingApproval} service={snap?.service ?? null} busy={busy}
+                            onYes={() => send("yes", "Yes, confirm")} onNo={() => send("no", "No, cancel")} />}
           </div>
-          {(choices.length > 0 || snap?.crashed) && (
+          {(choices.length > 0 || snap?.crashed || closed) && (
             <div className="quick">
               {snap?.crashed && <button className="danger" disabled={busy} onClick={() => control("/api/restart")}>Restart process</button>}
-              {choices.map((c) => <button key={c} disabled={busy} onClick={() => send(c)}>Option {c}</button>)}
+              {closed && <button className="primary" disabled={busy}
+                                 onClick={() => { setActive(null); newSession({ clock: "real" }); }}>Start a New chat</button>}
+              {choices.map((c) => <button key={c} disabled={busy} onClick={() => pick(c)}>
+                {snap?.option_labels?.[Number(c) - 1] ?? `Option ${c}`}</button>)}
             </div>
           )}
           <div className="composer">
-            <textarea ref={inputRef} value={input} autoFocus placeholder="Type a message…"
+            <textarea ref={inputRef} value={input} autoFocus disabled={closed}
+                      placeholder={closed ? "This chat is closed. Start a New chat to book a service." : "Type a message…"}
                       onChange={(e) => setInput(e.target.value)}
                       onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } }} />
-            <button className="primary" disabled={busy || !input.trim()} onClick={submit}>Send</button>
+            <button className="primary" disabled={busy || closed || !input.trim()} onClick={submit}>Send</button>
           </div>
           {input.length > MAX_CHARS && <div className="counter over">{input.length} / {MAX_CHARS} characters</div>}
         </section>
 
-        {open && (
+        {panel === "profile" && (
+          <aside className="drawer">
+            <div className="pane">
+              {snap ? <ProfilePane s={snap} /> : <div className="muted">Loading…</div>}
+            </div>
+          </aside>
+        )}
+        {panel === "details" && (
           <aside className="drawer">
             <div className="tabs">
               {TABS.map((t) => (

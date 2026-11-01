@@ -20,7 +20,7 @@ export type Booking = {
 };
 
 export type Snapshot = {
-  config: { scenario: string; parser: string; user: string; clock: string };
+  config: { scenario: string; user: string; clock: string };
   crashed: boolean;
   now: string;
   model: string;
@@ -31,14 +31,18 @@ export type Snapshot = {
   execution: Record<string, unknown> | null;
   hold: { hold_id: string; expires_at: string; quoted_price: number } | null;
   options: number;
+  option_labels: string[];
+  service: string | null;
+  suggestions: string[];
   turns: number;
   max_turns: number;
+  closed?: boolean;
+  strikes?: number;
   memory: Record<string, MemoryFact>;
   bookings: Booking[];
   events: TraceEvent[];
   next: number;
   scenarios: string[];
-  parsers: string[];
 };
 
 export type Reply = { reply: string | null; system?: boolean };

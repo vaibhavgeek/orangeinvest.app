@@ -19,7 +19,8 @@ _TAG = re.compile(r"<[^>]{0,40}>")
 
 
 def looks_like_injection(text: str) -> bool:
-    return any(p.search(text or "") for p in _INJ)
+    from .guard import PROVIDER_CATEGORIES, screen
+    return any(p.search(text or "") for p in _INJ) or screen(text or "", PROVIDER_CATEGORIES) is not None
 
 
 def clean_text(text: str, max_len: int = 200) -> str:

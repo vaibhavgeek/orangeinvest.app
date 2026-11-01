@@ -41,9 +41,6 @@ def main(argv=None):
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--trace-dir", default="traces")
     ap.add_argument("--fresh", action="store_true", help="wipe saved sessions, memory, provider world and traces")
-    ap.add_argument("--llm", nargs="?", const="openai", choices=["openai", "anthropic"],
-                    help="parse with an LLM instead of the rule-based parser (default: openai; key from "
-                         "OPENAI_API_KEY / ANTHROPIC_API_KEY or .env; model from OPENAI_MODEL)")
     a = ap.parse_args(argv)
     load_dotenv()
 
@@ -54,14 +51,10 @@ def main(argv=None):
             os.remove(trace)
     os.makedirs(a.data_dir, exist_ok=True)
 
-    model = None
-    if a.llm:
-        from .nlu import LLMModel, OpenAIModel
-        env = "OPENAI_API_KEY" if a.llm == "openai" else "ANTHROPIC_API_KEY"
-        if not os.environ.get(env):
-            sys.exit(f"--llm {a.llm} needs {env} (set it in the environment or in .env)")
-        model = (OpenAIModel(os.environ[env], os.environ.get("OPENAI_MODEL")) if a.llm == "openai"
-                 else LLMModel(os.environ[env]))
+    from .nlu import OpenAIModel
+    if not os.environ.get("OPENAI_API_KEY"):
+        sys.exit("OPENAI_API_KEY is not set (put it in the environment or in .env). The agent parses with OpenAI only.")
+    model = OpenAIModel.from_env()
     world = os.path.join(a.data_dir, "mock_world.json")
     scenario = Scenario(**SCENARIOS[a.scenario])
     if os.path.exists(world):
@@ -70,8 +63,7 @@ def main(argv=None):
     api = MockProviderAPI(clock=clock, scenario=scenario, user_id=a.user, path=world)
     agent = Agent(api, user_id=a.user, session_id=a.session, data_dir=a.data_dir, model=model, clock=clock,
                   limits=Limits(), trace_dir=a.trace_dir)
-    parser = model.name if model else "rule-based"
-    print(f"Errand agent — scenario '{a.scenario}', user {a.user}, parser {parser}. Type 'quit' to exit.")
+    print(f"Errand agent — scenario '{a.scenario}', user {a.user}, model {model.name}. Type 'quit' to exit.")
     try:
         note = agent.resume()
         if note:

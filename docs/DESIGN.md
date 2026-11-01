@@ -92,6 +92,7 @@ summary, error, latency), `approval` (created/granted/voided/consumed with finge
    back stays unverified. I'd add an outbox plus a background reconciler that sweeps `in_flight` executions and notifies the user.
 3. **Synchronous provider calls inside the chat turn.** Slow providers use up the 30 s turn budget. Execution should move to a job
    queue with per-provider rate limits and circuit breakers, with the chat streaming status updates.
-4. **The rule-based parser's coverage** (phrasings, areas, Hindi/Hinglish). I'd put an LLM extractor behind the same
-   `Parsed` schema (`OpenAIModel` and `LLMModel` adapters exist; `--llm` turns on OpenAI) and grow a recorded-conversation eval set to measure it. The rules stay as a fallback.
+4. **One model, no fallback.** Parsing and reply phrasing both go to OpenAI behind the `Parsed` schema; if it's down the
+   agent says so and changes nothing. I'd add a cost-tiered router across models and grow the recorded-conversation
+   eval set (Hindi/Hinglish, more phrasings) to measure each tier.
 5. **Traces as local files.** I'd ship them to OpenTelemetry with sampling, and alert on `approval_blocked`, `recovery` and limit exits.

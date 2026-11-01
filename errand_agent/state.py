@@ -42,4 +42,7 @@ def new_state(session_id: str, user_id: str) -> dict:
         "pending_memory": None,   # inferred fact awaiting the user's confirmation
         "last_result": None,
         "turns": 0,
+        "history": [],            # last few {user, agent prose} turns, context for the reply model only
+        "strikes": 0,             # attempts to use the agent for something other than errands (guard.py)
+        "closed": False,          # True after MAX_STRIKES: the session answers without any model call
     }

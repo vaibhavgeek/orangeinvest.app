@@ -51,10 +51,6 @@ function EventRow({ e }: { e: TraceEvent }) {
       <span className="t mono">t{e.turn}</span><span className="k mono">{k}</span><span className="mono">{s}</span>
       {e.type === "model_call" && x.dropped_fields?.length > 0 &&
         <span className="flag mono">  DROPPED {JSON.stringify(x.dropped_fields)}</span>}
-      {e.type === "model_call" && x.fallback_reason &&
-        <span className="flag mono">  FALLBACK → rules ({x.fallback_reason})</span>}
-      {e.type === "model_call" && x.date_override &&
-        <span className="flag warn mono">  dates fixed by code {JSON.stringify(x.date_override)}</span>}
       {open && <pre>{JSON.stringify(e, null, 2)}</pre>}
     </div>
   );
@@ -110,6 +106,49 @@ function factValue(k: string, f: MemoryFact): string {
   if (v && typeof v === "object") return `${v.name} (${v.id})`;
   if (k === "earliest_time" && typeof v === "number") return hhmm(v);
   return v == null ? "—" : String(v);
+}
+
+const LABELS: Record<string, string> = { area: "Area", earliest_time: "Earliest start time" };
+const factLabel = (k: string) => k.startsWith("preferred_provider:")
+  ? `Preferred ${k.split(":")[1].replace(/_/g, " ").replace("ac service", "AC servicing")}` : LABELS[k] ?? k;
+
+/** The user's view of memory: what the agent knows about them and whether it uses it. */
+export function ProfilePane({ s }: { s: Snapshot }) {
+  const facts = Object.entries(s.memory || {}).filter(([, f]) => f.status === "active");
+  const forgotten = Object.entries(s.memory || {}).filter(([, f]) => f.status !== "active");
+  return (
+    <>
+      <div className="card profile">
+        <h3>Your profile</h3>
+        <div className="prow"><span>City</span><b>Bangalore</b><em>default · the only city for now</em></div>
+        {facts.map(([k, f]) => {
+          const used = f.source === "stated" || f.confirmed;
+          return (
+            <div key={k} className="prow">
+              <span>{factLabel(k)}</span><b>{factValue(k, f)}</b>
+              <em className={used ? "" : "warn"}>
+                {f.source === "stated" ? "you told me"
+                  : used ? (String(f.evidence ?? "").startsWith("BK-") ? `confirmed · you booked them (${f.evidence})`
+                    : "confirmed by you")
+                  : "from your bookings, not used until you confirm"}
+              </em>
+            </div>
+          );
+        })}
+        {!facts.length && <div className="muted" style={{ marginTop: 6 }}>I don't remember anything else about you yet.</div>}
+      </div>
+      {forgotten.length > 0 && (
+        <div className="card">
+          <h3>Forgotten (never used again)</h3>
+          <div className="muted">{forgotten.map(([k]) => factLabel(k)).join(", ")}</div>
+        </div>
+      )}
+      <div className="muted">
+        I remember these to serve you better, and always ask before booking or changing anything. Change them in the
+        chat: “my area is HSR Layout”, “forget my area”, “forget everything”.
+      </div>
+    </>
+  );
 }
 
 export function MemoryPane({ s }: { s: Snapshot }) {
@@ -284,12 +323,12 @@ export function PlaybooksPane(props: {
         </div>
       ))}
       <div className="card" style={{ marginTop: 16 }}>
-        <h3>Free-form things to try (best with the OpenAI parser)</h3>
+        <h3>Free-form things to try</h3>
         <ul>
           {FREE_FORM.map((t) => <li key={t} style={{ marginBottom: 6 }}><button className="chip" onClick={() => props.onPick(t)}>{t}</button></li>)}
         </ul>
         <div className="muted">
-          Click to put it in the box, edit, then send. With the OpenAI parser, check the MODEL rows in the trace: anything outside
+          Click to put it in the box, edit, then send. Check the MODEL rows in the trace: anything outside
           the schema shows up as DROPPED.
         </div>
       </div>

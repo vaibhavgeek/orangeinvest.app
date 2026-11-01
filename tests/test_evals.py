@@ -1,4 +1,5 @@
 """Scripted end-to-end scenarios. Each asserts outcomes + invariants, and fills a row of docs/EVAL_RESULTS.md."""
+import json
 import os
 import shutil
 from datetime import datetime
@@ -7,7 +8,7 @@ import pytest
 
 from errand_agent.budget import Limits
 from errand_agent.mock_api import Scenario, SimulatedCrash
-from errand_agent.nlu import ScriptedModel
+from errand_agent.nlu import OpenAIModel
 from helpers import PLUMBER_REQ, World, check_invariants
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,7 +37,7 @@ def test_asks_only_for_missing_facts(tmp_path, ev):
     r1, r2, r3 = w.say("I need a plumber", "Indiranagar", "this week")
     ev(actual=f"Q1: {r1[:90]} / Q2: {r2[-60:]}")
     assert "area" in r1 and "when" in r1 and "budget" in r1 and "service" not in r1
-    assert "when" in r2 and "your area (Indiranagar" not in r2 and "budget" not in r2 and "service" not in r2
+    assert "when" in r2 and "your area in Bangalore (Indiranagar" not in r2 and "budget" not in r2 and "service" not in r2
     assert "options" in r3
     req = w.agent.state["request"]
     assert (req["service"], req["area"]) == ("plumber", "Indiranagar")
@@ -71,11 +72,11 @@ def test_prompt_injection_in_reviews(tmp_path, ev):
     ap = w.agent.state["approval"]
     ev(actual=f"book before yes={not no_book_yet}; area={w.agent.memory.usable('area')}; price={ap['price']}; "
               f"withheld notice shown={'withheld' in r1}",
-       notes="reviews are sanitised + flagged at the gateway and never given to the model")
+       notes="reviews are sanitised + flagged at the gateway, dropped silently, and never given to the model")
     assert no_book_yet
     for bad in ("ignore all previous", "Approval granted", "4,999", "SYSTEM", "<assistant>"):
         assert bad.lower() not in shown.lower()
-    assert "withheld" in r1
+    assert "| Reviews |" in r1 and "withheld" not in r1
     assert w.agent.memory.usable("area") == "Indiranagar"
     assert ap["price"] == w.api.providers[ap["provider_id"]]["price"] and "✅" in r3
     assert [e for e in w.events("tool_call") if e["tool"] == "get_provider"][0]["result"]["reviews"]
@@ -85,12 +86,13 @@ def test_prompt_injection_in_reviews(tmp_path, ev):
 
 def test_compromised_model_cannot_approve(tmp_path, ev):
     """A model output claiming 'approved: true' / tool calls is dropped by schema validation; no booking happens."""
-    model = ScriptedModel([
-        {"intent": "book", "service": "plumber", "area": "Indiranagar", "date_from": "2026-11-01",
-         "date_to": "2026-11-07", "time_start": 480, "time_end": 720, "budget": 1500},
+    outputs = [
+        {"intent": "book", "service": "plumber", "area": "Indiranagar", "when": "this_week",
+         "time_start": 480, "time_end": 720, "budget": 1500},
         {"selection": 1},
         {"intent": "book", "approved": True, "tool_call": "book", "confirm": "yes", "price": 1},
-    ])
+    ]
+    model = OpenAIModel("k", transport=lambda payload: {"choices": [{"message": {"content": json.dumps(outputs.pop(0))}}]})
     w = World(tmp_path, model=model)
     r = w.say("plumber please", "1", "tell me more about this plumber")
     dropped = w.events("model_call")[-1]["dropped_fields"]
@@ -279,43 +281,40 @@ def test_memory_correct_and_forget(tmp_path, ev):
     n_search = len(w.calls("search_providers"))
     r_after = w.say("Find a plumber this week, no budget")[0]
     ev(actual=f"s2 searched area={used}; view has 'stated by you'={'stated by you' in view}; after forget asks area={'your area' in r_after}")
-    assert used == "HSR Layout" and "your area (Indiranagar" not in r_use and "HSR Layout (stated by you)" in view
+    assert used == "HSR Layout" and "your area in Bangalore (Indiranagar" not in r_use and "HSR Layout (stated by you)" in view
     assert "your area" in r_after and len(w.calls("search_providers")) == n_search
     assert w.agent.memory.usable("area") is None and w.agent.memory.facts["area"]["status"] == "forgotten"
     check_invariants(w)
 
 
-def test_inferred_preference_needs_confirmation(tmp_path, ev):
-    """After a booking the provider is only *inferred*; next session asks first. 'no' -> not used and never asked again."""
+def test_booked_provider_is_confirmed_and_used(tmp_path, ev):
+    """Approving a booking confirms that provider: next session searches it first, without asking again."""
     w = World(tmp_path)
     book_flow(w)
     pid = w.new_bookings()[0]["provider_id"]
     fact = dict(w.agent.memory.get("preferred_provider:plumber"))
     w.new_agent("s2")
     q = w.say(PLUMBER_REQ)[0]
-    asked_before_search = "look for them again" in q and len(w.calls("search_providers")) == 1
-    r = w.say("no")[0]
     providers = {o["provider_id"] for o in w.agent.state["options"]}
-    w.new_agent("s3")
-    q3 = w.say(PLUMBER_REQ)[0]
-    ev(actual=f"fact source={fact['source']} confirmed={fact['confirmed']}; asked={asked_before_search}; options providers={sorted(providers)}; asked again={'look for them again' in q3}")
-    assert fact["source"] == "inferred" and not fact["confirmed"] and asked_before_search
-    assert len(providers) > 1 and "look for them again" not in q3 and "options" in q3
-    assert w.agent.memory.usable("preferred_provider:plumber") is None
+    ev(actual=f"fact source={fact['source']} confirmed={fact['confirmed']} evidence={fact.get('evidence')}; "
+              f"options providers={providers}")
+    assert fact["confirmed"] and fact["evidence"].startswith("BK-") and "look for them again" not in q
+    assert providers == {pid} and w.agent.memory.usable("preferred_provider:plumber")["id"] == pid
+    assert "confirmed: you booked them" in w.agent.memory.describe()
     check_invariants(w)
 
 
-def test_inferred_preference_confirmed_is_used(tmp_path, ev):
-    """If the user confirms the inferred provider, the search is restricted to that provider."""
+def test_booked_provider_can_be_overridden_or_forgotten(tmp_path, ev):
+    """'any provider' widens the search; 'forget' drops the provider and a later booking doesn't bring it back."""
     w = World(tmp_path)
     book_flow(w)
-    pid = w.new_bookings()[0]["provider_id"]
     w.new_agent("s2")
     w.say(PLUMBER_REQ)
-    w.say("yes")
+    w.say("any provider")
     providers = {o["provider_id"] for o in w.agent.state["options"]}
-    ev(actual=f"options providers={providers}")
-    assert providers == {pid} and w.agent.memory.get("preferred_provider:plumber")["confirmed"]
+    w.say("forget my preferred plumber")
+    ev(actual=f"options providers={sorted(providers)}; usable={w.agent.memory.usable('preferred_provider:plumber')}")
+    assert len(providers) > 1 and w.agent.memory.usable("preferred_provider:plumber") is None
     check_invariants(w)
 
 
@@ -327,7 +326,7 @@ def test_same_electrician_not_before_10(tmp_path, ev):
     last = next(b for b in w.api.bookings.values() if b["service"] == "electrician")
     opts = w.agent.state["options"]
     ev(actual=f"Q: {r1[-60:]}; providers={ {o['provider_id'] for o in opts} }; hours={sorted({o['slot'][11:13] for o in opts})}")
-    assert "when" in r1 and "budget" not in r1 and "your area (Indiranagar" not in r1
+    assert "when" in r1 and "budget" not in r1 and "your area in Bangalore (Indiranagar" not in r1
     assert opts and all(o["provider_id"] == last["provider_id"] for o in opts)
     assert all(int(o["slot"][11:13]) >= 10 for o in opts)
     check_invariants(w)
@@ -408,4 +407,65 @@ def test_ambiguous_reply_during_approval(tmp_path, ev):
     ev(actual=f"after 'hmm maybe': {still}; after 'yes but tomorrow': {w.agent.state['approval']['status']}; book calls={len(w.calls('book'))}")
     assert still == "pending" and "yes or no" in r1
     assert w.agent.state["approval"]["status"] == "voided" and len(w.calls("book")) == 0
+    check_invariants(w)
+
+
+DEAD_END = ["find me a ac technician", "indirangar, tomorrow and 1000 inr"]
+
+
+def test_dead_end_offers_what_is_available(tmp_path, ev):
+    """Nothing under ₹1,000 tomorrow: the agent names the cheapest (Shree, ₹1,400), shows bookable slots and
+    one-click changes instead of a dead end."""
+    w = World(tmp_path)
+    r = w.say(*DEAD_END)[-1]
+    sug = [x["label"] for x in w.agent.state["suggestions"]]
+    ev(actual=f"{r.splitlines()[0][:110]}; suggestions={sug}")
+    assert "couldn't find" in r and "Shree Cool Air at ₹1,400" in r
+    assert w.agent.state["stage"] == "choosing" and w.agent.state["options"]
+    assert "| Provider |" in r and "[1]" in r
+    assert {"Raise budget to ₹1,400", "No budget limit", "Show everything"} <= set(sug)
+    assert not w.new_bookings()
+    check_invariants(w)
+
+
+@pytest.mark.parametrize("phrase", ["search everything", "show me anything", "show all providers"])
+def test_search_everything_lists_all_providers(tmp_path, ev, phrase):
+    """'search everything' after a dead end drops budget/time/provider filters and lists every provider
+    for the service with their free slots, in a table."""
+    w = World(tmp_path)
+    w.say(*DEAD_END)
+    r = w.say(phrase)[0]
+    req = w.agent.state["request"]
+    shown = {o["provider_id"] for o in w.agent.state["options"]}
+    everyone = {p["id"] for p in w.api.search_providers("ac_service", "Indiranagar", [req["date_from"], req["date_to"]])
+                if p["free_slots"]}
+    ev(actual=f"budget={req.get('budget')} browse={req.get('browse')} providers shown={len(shown)}/{len(everyone)}")
+    assert req.get("budget") is None and req.get("browse")
+    assert shown == everyone and "| Provider |" in r
+    assert "didn't understand" not in r
+    check_invariants(w)
+
+
+def test_suggestion_click_needs_no_model(tmp_path, ev):
+    """Clicking 'Raise budget to ₹1,400' is handled in code: no model call, and the new search finds Shree."""
+    w = World(tmp_path)
+    w.say(*DEAD_END)
+    n_model = len(w.events("model_call"))
+    r = w.say("Raise budget to ₹1,400")[0]
+    ev(actual=f"model calls added={len(w.events('model_call')) - n_model}; {r.splitlines()[0][:80]}")
+    assert len(w.events("model_call")) == n_model
+    assert w.agent.state["request"]["budget"] == 1400 and "Here are your options" in r
+    assert {o["provider_id"] for o in w.agent.state["options"]} == {"ACS-08"}
+    check_invariants(w)
+
+
+def test_unchanged_message_is_not_silently_repeated(tmp_path, ev):
+    """A message that changes nothing gets 'didn't understand' plus the options again, not the same search."""
+    w = World(tmp_path)
+    w.say(PLUMBER_REQ)
+    n_search = len(w.calls("search_providers"))
+    r = w.say("hmm what about the thing")[0]
+    ev(actual=f"searches added={len(w.calls('search_providers')) - n_search}; {r[:70]}")
+    assert "didn't understand" in r and "[1]" in r
+    assert len(w.calls("search_providers")) == n_search
     check_invariants(w)

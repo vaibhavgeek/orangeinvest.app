@@ -4,7 +4,8 @@
 #   ./try_it.sh test            only run the tests and open the eval table
 #   ./try_it.sh chat [SCENARIO] only open chat + live trace (default scenario: timeout_after_success)
 #   ./try_it.sh web             backend + React test console with red-team playbooks (http://127.0.0.1:5173)
-#   LLM=openai ./try_it.sh chat  parse with OpenAI (key from .env OPENAI_API_KEY; model OPENAI_MODEL, default gpt-6.1-terra)
+# Chat and web parse with OpenAI (key from .env OPENAI_API_KEY; model OPENAI_MODEL, default gpt-6.1-terra).
+# Tests replay recorded OpenAI responses (tests/cassettes/) and need no key.
 # Scenarios: default timeout_after_success timeout_not_booked slot_taken price_change crash_after_book
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -12,7 +13,6 @@ ROOT="$(pwd)"
 PY="${PYTHON:-python3}"
 MODE="${1:-all}"
 SCENARIO="${2:-timeout_after_success}"
-LLM_FLAG="${LLM:+--llm $LLM}"
 
 run_tests() {
   "$PY" -c "import pytest" 2>/dev/null || "$PY" -m pip install -q -r requirements.txt
@@ -30,14 +30,14 @@ run_chat() {
 tell application "Terminal"
   activate
   do script "cd '$ROOT' && clear && echo '── LIVE TRACE ──' && $PY -m errand_agent.tracefmt --follow traces/demo.jsonl"
-  do script "cd '$ROOT' && clear && $PY -m errand_agent.cli --scenario $SCENARIO $LLM_FLAG"
+  do script "cd '$ROOT' && clear && $PY -m errand_agent.cli --scenario $SCENARIO"
 end tell
 EOF
     echo "✔ Opened two Terminal windows: chat (scenario: $SCENARIO) and live trace."
     echo "  Try: Find a plumber for my kitchen tap this week, mornings only, under ₹1,500  →  Indiranagar  →  1  →  yes"
   else
     echo "Open a second terminal and run: $PY -m errand_agent.tracefmt --follow traces/demo.jsonl"
-    "$PY" -m errand_agent.cli --scenario "$SCENARIO" $LLM_FLAG
+    "$PY" -m errand_agent.cli --scenario "$SCENARIO"
   fi
 }
 
@@ -45,7 +45,7 @@ run_web() {
   command -v npm >/dev/null || { echo "npm not found: install Node.js 18+ (https://nodejs.org)"; exit 1; }
   [[ -d web/node_modules ]] || (cd web && npm install --no-audit --no-fund)
   echo "▶ Backend (Python) on http://127.0.0.1:8000"
-  "$PY" -m errand_agent.web --port 8000 $LLM_FLAG &
+  "$PY" -m errand_agent.web --port 8000 &
   BACKEND_PID=$!
   trap 'kill $BACKEND_PID 2>/dev/null' EXIT INT TERM
   sleep 1

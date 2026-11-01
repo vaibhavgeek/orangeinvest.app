@@ -1,4 +1,4 @@
-"""Every red-team playbook shown in the web UI must hold, offline, with the deterministic parser."""
+"""Every red-team playbook shown in the web UI must hold, offline, with recorded OpenAI responses."""
 import pytest
 
 from errand_agent.redteam import load, run

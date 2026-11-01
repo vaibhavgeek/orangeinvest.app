@@ -63,6 +63,18 @@ class MemoryStore:
         self._save()
         return True
 
+    def booked(self, key: str, value, booking_id: str) -> bool:
+        """The user explicitly approved a booking with this provider: that counts as confirming it."""
+        f = self.facts.get(key)
+        if f and (f["status"] == "forgotten" or f["source"] == "stated"):
+            return False  # never resurrect forgotten facts, never override what the user said
+        if f and f["value"] == value and f["confirmed"]:
+            return False
+        self.facts[key] = {"value": value, "source": "inferred", "confirmed": True, "status": "active",
+                           "evidence": booking_id, "updated_at": datetime.now().isoformat(timespec="seconds")}
+        self._save()
+        return True
+
     def confirm(self, key: str):
         if self.get(key):
             self.facts[key]["confirmed"] = True
@@ -86,7 +98,8 @@ class MemoryStore:
             if f["source"] == "stated":
                 src = "stated by you"
             elif f["confirmed"]:
-                src = "inferred from your bookings, confirmed by you"
+                src = (f"confirmed: you booked them ({f['evidence']})" if str(f.get("evidence", "")).startswith("BK-")
+                       else "inferred from your bookings, confirmed by you")
             else:
                 src = "inferred from your bookings — NOT used until you confirm"
             lines.append(f"• {label(k)}: {show_value(k, f['value'])} ({src})")

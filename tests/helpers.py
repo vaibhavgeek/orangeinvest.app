@@ -4,6 +4,7 @@ from datetime import datetime
 
 from errand_agent.agent import Agent
 from errand_agent.budget import Limits
+from errand_agent.cassette import replay_model
 from errand_agent.clock import FakeClock
 from errand_agent.mock_api import MockProviderAPI, Scenario
 from errand_agent.trace import Tracer
@@ -18,7 +19,7 @@ class World:
         self.api = MockProviderAPI(self.clock, scenario or Scenario())
         self.data_dir = str(tmp_path / "data")
         self.limits = limits or Limits()
-        self.model = model
+        self.model = model  # None: the real OpenAIModel, replaying recorded responses (tests/cassettes/)
         self.trace_path = trace_path
         if trace_path and os.path.exists(trace_path):
             os.remove(trace_path)
@@ -31,7 +32,8 @@ class World:
         if self.tracer is None or self.tracer.session_id != session_id:
             self.tracer = Tracer(session_id, self.trace_path)
         a = Agent(self.api, user_id="u1", session_id=session_id, data_dir=self.data_dir, clock=self.clock,
-                  model=self.model, limits=self.limits, tracer=self.tracer)
+                  model=self.model or replay_model(), limits=self.limits, tracer=self.tracer,
+                  phrase_replies=False)  # assert on the facts code decided; wording is the model's job
         self.agent = a
         self.agents.append(a)
         return a

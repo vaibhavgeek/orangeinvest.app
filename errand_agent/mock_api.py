@@ -37,6 +37,7 @@ SERVICES = {
     "carpenter": ("CRP", "Woodworks", (600, 2500)),
     "pest_control": ("PST", "Pest Control", (1200, 3500)),
 }
+CITY = "Bangalore"  # the default and, for now, the only city; AREAS are all in it
 AREAS = ["Indiranagar", "Koramangala", "HSR Layout", "Whitefield", "Jayanagar", "Malleshwaram"]
 NAMES = ["Sharma", "Raju", "QuickFix", "Ravi", "Anand", "Metro", "Prime", "Shree", "HomeCare", "Urban"]
 ATTRS = ["verified", "same-day", "90-day warranty", "female technician available", "weekend available", "eco-friendly"]

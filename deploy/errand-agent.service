@@ -7,7 +7,7 @@ User=errand
 WorkingDirectory=/opt/errand-agent
 Environment=TZ=Asia/Kolkata
 Environment=PYTHONUNBUFFERED=1
-# Optional: OPENAI_API_KEY=..., LLM_DAILY_CAP=500 (enables the OpenAI parser in the UI)
+# Required: OPENAI_API_KEY=...  Optional: OPENAI_MODEL=..., LLM_DAILY_CAP=500
 EnvironmentFile=-/etc/errand-agent.env
 ExecStart=/usr/bin/python3 -m errand_agent.web --host 127.0.0.1 --port 8000 --data-dir /var/lib/errand-agent
 Restart=always

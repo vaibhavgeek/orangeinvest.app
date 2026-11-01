@@ -36,15 +36,19 @@ Other things to try: `Move my AC servicing to Saturday`, `Book the same electric
 In `crash_after_book` the process dies right after the provider accepts the booking. Run the same command again
 without `--fresh` and the agent reconciles on start.
 
-`--llm` switches parsing to OpenAI (`gpt-6.1-terra` by default; override with `OPENAI_MODEL=gpt-6.1-sol`).
-The key is read from `OPENAI_API_KEY` or a gitignored `.env` file (`OPENAI_API_KEY=sk-...`). `--llm anthropic`
-uses `ANTHROPIC_API_KEY`. With the helper script: `LLM=openai ./try_it.sh chat`.
+The agent uses OpenAI only (`gpt-6.1-terra` by default; override with `OPENAI_MODEL`). The key is read from
+`OPENAI_API_KEY` or a gitignored `.env` file (`OPENAI_API_KEY=sk-...`); the CLI and the backend refuse to start without it.
 
-The LLM only fills the same typed `Parsed` record the rule parser produces. Unknown fields such as
-`"approved": true` are dropped, and approval is still decided by code from the raw text, never by the model. Calendar dates are
-resolved by code when it recognises the phrase, because the model got "tomorrow" wrong in testing. Any API or
-JSON error falls back to the rule parser, and the trace records `fallback_reason`. The default parser is
-deterministic and is the one the evals use, so `pytest` never calls the network.
+OpenAI does two jobs per turn. It **parses** the message into the typed `Parsed` record: unknown fields such as
+`"approved": true` are dropped, and the model names the day (`tomorrow`, `next_week`, `10-15`) while code computes
+the dates. Then it **phrases the reply** from the facts code decided. Tables, slot lists, the "Please confirm: …" line
+and the one-click suggestions are appended verbatim and never pass through the model, so prices and slots can't be
+altered. Approval is still decided by code from the raw text (strict yes/no check), never by the model. If the model
+is unreachable while parsing, the agent says so and changes nothing; if it fails while phrasing, the plain facts are sent.
+
+Tests and red-team playbooks replay recorded OpenAI responses (`tests/cassettes/openai.json`), so `pytest` needs no
+network or key. After a prompt change, re-record with `CASSETTE_MODE=record python3 -m pytest` (add `CASSETTE_PRUNE=1`
+on a full run to drop unused recordings).
 
 ## Layout
 
@@ -54,7 +58,8 @@ deterministic and is the one the evals use, so `pytest` never calls the network.
 | `errand_agent/tools.py` | `ToolGateway`: budget, tracing, sanitising, and the **approval check on every mutating call** |
 | `errand_agent/agent.py` | The state machine: collect → choose → approve → execute → verify |
 | `errand_agent/approval.py` | Approval records, fingerprints, strict yes/no detection |
-| `errand_agent/nlu.py` | Rule-based parser (default), `ScriptedModel` for evals, optional `OpenAIModel` and `LLMModel` (Anthropic) |
+| `errand_agent/nlu.py` | `OpenAIModel`: parse to the `Parsed` schema, `resolve_when` (code-owned dates), reply phrasing |
+| `errand_agent/cassette.py` | Record/replay of OpenAI responses for offline tests |
 | `errand_agent/memory.py` | Persistent preferences marked stated/inferred, with confirm and forget |
 | `errand_agent/state.py`, `trace.py`, `budget.py` | Persisted workflow state, JSONL traces, hard limits |
 | `tests/test_evals.py` | 28 scripted scenarios with invariant checks → `docs/EVAL_RESULTS.md` |
@@ -87,5 +92,5 @@ deterministic and is the one the evals use, so `pytest` never calls the network.
 - **Backend:** Ubuntu 24.04 on EC2 (t4g.small, ap-south-1, Elastic IP). `deploy/setup_ec2.sh` installs the service
   under systemd and puts Caddy in front for automatic HTTPS on `<ip>.sslip.io`. To update after a push:
   `ssh ubuntu@<ip> 'sudo DOMAIN=3-111-160-146.sslip.io bash /opt/errand-agent/deploy/setup_ec2.sh'`.
-- The OpenAI parser is enabled on the server through `/etc/errand-agent.env`, which is never committed. LLM messages are
-  capped per day (`LLM_DAILY_CAP`). The rule-based parser is the default.
+- `OPENAI_API_KEY` lives on the server in `/etc/errand-agent.env`, which is never committed; the backend won't start
+  without it. Messages are capped per day (`LLM_DAILY_CAP`).

@@ -20,6 +20,7 @@ from .budget import Limits
 from .cli import SCENARIOS, load_dotenv
 from .clock import SystemClock
 from .mock_api import MockProviderAPI, Scenario, SimulatedCrash
+from .nlu import OpenAIModel
 
 DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "dist")
 PLAYBOOKS = os.path.join(os.path.dirname(__file__), "static", "playbooks.json")
@@ -43,12 +44,14 @@ class OffsetClock(SystemClock):
 
 
 class App:
-    def __init__(self, data_dir: str, clock_factory=OffsetClock):
+    def __init__(self, data_dir: str, clock_factory=OffsetClock, model_factory=None, phrase_replies: bool = True):
         self.root = data_dir
+        self.phrase_replies = phrase_replies
         self.clock_factory = clock_factory
+        self.model_factory = model_factory or OpenAIModel.from_env
         self.lock = threading.Lock()
         self.agent = None
-        self.config = {"scenario": "default", "parser": "rules", "user": "u1", "clock": "real"}
+        self.config = {"scenario": "default", "user": "u1", "clock": "real"}
         self.crashed = False
 
     @property
@@ -59,18 +62,6 @@ class App:
     def trace_path(self):
         return os.path.join(self.root, "traces", f"{SESSION}.jsonl")
 
-    def _model(self):
-        parser = self.config["parser"]
-        if parser == "rules":
-            return None
-        from .nlu import LLMModel, OpenAIModel
-        env = "OPENAI_API_KEY" if parser == "openai" else "ANTHROPIC_API_KEY"
-        if not os.environ.get(env):
-            raise ValueError(f"{env} is not set (put it in .env or the environment)")
-        if parser == "openai":
-            return OpenAIModel(os.environ[env], os.environ.get("OPENAI_MODEL"))
-        return LLMModel(os.environ[env])
-
     def _boot(self, first: bool):
         """Start an agent process. On a restart the provider world, session state and memory are reloaded
         from disk, exactly as a real process restart would see them."""
@@ -80,26 +71,20 @@ class App:
         world = os.path.join(self.data_dir, "mock_world.json")
         self.api = MockProviderAPI(clock=self.clock, scenario=scenario, user_id=self.config["user"], path=world)
         self.agent = Agent(self.api, user_id=self.config["user"], session_id=SESSION, data_dir=self.data_dir,
-                           model=self._model(), clock=self.clock, limits=Limits(),
-                           trace_dir=os.path.dirname(self.trace_path))
+                           model=self.model_factory(), clock=self.clock, limits=Limits(),
+                           trace_dir=os.path.dirname(self.trace_path), phrase_replies=self.phrase_replies)
         self.crashed = False
         return self.agent.resume()
 
     def reset(self, cfg: dict) -> dict:
         new = {k: cfg.get(k, v) for k, v in self.config.items()}
-        if new["scenario"] not in SCENARIOS or new["parser"] not in ("rules", "openai", "anthropic"):
-            raise ValueError("unknown scenario or parser")
+        if new["scenario"] not in SCENARIOS:
+            raise ValueError("unknown scenario")
         if new["clock"] not in ("real", "fixed"):
             raise ValueError("clock must be 'real' or 'fixed'")
         if not str(new["user"]).isalnum():
             raise ValueError("user id must be alphanumeric")
-        old = self.config
         self.config = new
-        try:
-            self._model()
-        except ValueError:
-            self.config = old
-            raise
         shutil.rmtree(self.root, ignore_errors=True)
         os.makedirs(self.data_dir, exist_ok=True)
         # "fixed" starts the clock at the same moment the offline tests use, so playbooks behave identically
@@ -147,11 +132,13 @@ class App:
             "config": self.config, "crashed": self.crashed, "now": now.strftime("%a %d %b %Y, %H:%M"),
             "model": self.agent.model.name, "stage": S["stage"], "intent": S["intent"],
             "request": S["request"], "approval": S.get("approval"), "execution": S.get("execution"),
-            "hold": S.get("hold"), "options": len(S["options"]), "turns": S["turns"],
+            "hold": S.get("hold"), "options": len(S["options"]), "option_labels": self.agent.option_labels(),
+            "turns": S["turns"], "service": S["request"].get("service") or (S.get("target") or {}).get("service"),
+            "suggestions": [x["label"] for x in S.get("suggestions") or []],
             "max_turns": self.agent.limits.max_turns,
+            "closed": bool(S.get("closed")), "strikes": S.get("strikes", 0),
             "memory": self.agent.memory.facts, "bookings": bookings,
             "events": events, "next": since + len(events), "scenarios": sorted(SCENARIOS),
-            "parsers": Hub.parsers(),
         }
 
 
@@ -162,9 +149,9 @@ class Hub:
     """One App per browser session, created on first use. Oldest sessions are evicted past max_sessions.
     LLM-parsed messages are capped per day across all sessions so a public deployment can't run up a bill."""
 
-    def __init__(self, root: str, default_parser: str = "rules", max_sessions: int = 300,
+    def __init__(self, root: str, max_sessions: int = 300,
                  llm_daily_cap: int = int(os.environ.get("LLM_DAILY_CAP", "1500"))):
-        self.root, self.default_parser = root, default_parser
+        self.root = root
         self.max_sessions, self.llm_daily_cap = max_sessions, llm_daily_cap
         self.sessions: OrderedDict = OrderedDict()
         self.lock = threading.Lock()
@@ -179,19 +166,13 @@ class Hub:
             app = self.sessions.get(sid)
             if app is None:
                 app = App(os.path.join(self.root, sid))
-                parser = self.default_parser if self.default_parser in self.parsers() else "rules"
-                app.reset({"parser": parser})
+                app.reset({})
                 self.sessions[sid] = app
                 while len(self.sessions) > self.max_sessions:
                     _, old = self.sessions.popitem(last=False)
                     shutil.rmtree(old.root, ignore_errors=True)
             self.sessions.move_to_end(sid)
             return app
-
-    @staticmethod
-    def parsers():
-        return ["rules"] + [p for p, env in (("openai", "OPENAI_API_KEY"), ("anthropic", "ANTHROPIC_API_KEY"))
-                            if os.environ.get(env)]
 
     def charge_llm(self) -> bool:
         with self.lock:
@@ -282,13 +263,11 @@ def make_handler(hub: Hub):
                         text = body.get("text")
                         if not isinstance(text, str):
                             raise ValueError("text must be a string")
-                        if app.config["parser"] != "rules" and not hub.charge_llm():
-                            return self._send(429, {"error": "Today's LLM message budget for this demo is used up. "
-                                                             "Start a new session with the rule-based parser."})
+                        if not hub.charge_llm():
+                            return self._send(429, {"error": "Today's message budget for this demo is used up. "
+                                                             "Please try again tomorrow."})
                         out = app.message(text)
                     elif self.path == "/api/reset":
-                        if body.get("parser", "rules") not in hub.parsers():
-                            raise ValueError(f"parser {body.get('parser')!r} is not available on this server")
                         out = app.reset(body)
                     elif self.path == "/api/restart":
                         out = app.restart()
@@ -310,11 +289,11 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="127.0.0.1", help="bind address (localhost only by default)")
     ap.add_argument("--data-dir", default="web_data")
-    ap.add_argument("--llm", nargs="?", const="openai", choices=["openai", "anthropic"],
-                    help="start with an LLM parser (can be switched in the UI)")
     a = ap.parse_args(argv)
     load_dotenv()
-    hub = Hub(a.data_dir, default_parser=a.llm or ("openai" if os.environ.get("OPENAI_API_KEY") else "rules"))
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise SystemExit("OPENAI_API_KEY is not set (put it in .env or the environment). The agent parses with OpenAI only.")
+    hub = Hub(a.data_dir)
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(hub))
     print(f"Errand agent backend on http://{a.host}:{a.port}  (Ctrl+C to stop)")
     try:

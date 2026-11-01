@@ -1,24 +1,38 @@
 """The errand agent: an explicit state machine. The model only parses text; this code decides."""
+import json
 import os
 import re
 import uuid
 from datetime import datetime, timedelta
 
+from . import guard
 from .approval import ApprovalError, is_affirmative, is_negative, new_approval
 from .budget import Budget, LimitExceeded, Limits
 from .clock import SystemClock
 from .memory import MemoryStore, label, show_value
-from .mock_api import AREAS, ToolError, ToolTimeout
-from .nlu import RuleBasedModel
+from .mock_api import AREAS, CITY, ToolError, ToolTimeout
+from .nlu import SERVICE_NAMES, ModelUnavailable, OpenAIModel
 from .state import StateStore, new_state
 from .tools import ToolGateway
 
-SERVICE_NAMES = {"plumber": "plumber", "electrician": "electrician", "ac_service": "AC servicing",
-                 "cleaning": "home cleaning", "carpenter": "carpenter", "pest_control": "pest control"}
+
+V = "\x1e"  # wraps parts of a reply shown verbatim (tables, lists, the approval line, suggestion chips)
+
+
+def verbatim(s: str) -> str:
+    return f"{V}{s}{V}"
 
 
 LEAD_MINUTES = 60          # earliest bookable slot is this far from now
 MAX_MESSAGE_CHARS = 1000   # longer messages are refused before any (paid) model call
+MAX_STRIKES = 3            # off-purpose / injection attempts before the session is closed
+
+SERVICES_LINE = "plumber, electrician, AC servicing, home cleaning, carpenter and pest control"
+CLOSED_MESSAGE = ("This chat is closed because it was used for things other than booking errands. Start a New chat "
+                  "to book, reschedule or cancel a home service.")
+_LINK = re.compile(r"https?://[^\s)\]>]+|\bwww\.[^\s)\]>]+", re.I)
+_AMOUNT = re.compile(r"₹\s?(\d[\d,]*)")
+_SECRET = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}|openai_api_key|you extract structured fields|how a turn works", re.I)
 
 
 def fmt_slot(slot: str) -> str:
@@ -36,7 +50,7 @@ def rupees(n) -> str:
 class Agent:
     def __init__(self, api, user_id: str = "u1", session_id: str = "s1", data_dir: str = "data",
                  clock=None, model=None, limits: Limits | None = None, trace_dir: str | None = None,
-                 tracer=None):
+                 tracer=None, phrase_replies: bool = True):
         from .trace import Tracer
         self.clock = clock or SystemClock()
         self.limits = limits or Limits()
@@ -47,11 +61,13 @@ class Agent:
         trace_path = os.path.join(trace_dir, f"{session_id}.jsonl") if trace_dir else None
         self.tracer = tracer or Tracer(session_id, trace_path)
         self.tracer.turn = self.state["turns"]
-        self.model = model or RuleBasedModel()
+        self.model = model or OpenAIModel.from_env()
+        self.phrase_replies = phrase_replies  # False only in tests that assert on the code's facts
         self.tools = ToolGateway(api, user_id, self.budget, self.tracer, self.clock)
         if self.state.get("hold"):
             self.tools.register_hold(self.state["hold"])
         self._effects: list = []
+        self._turn_note = ""
         self.tracer.event("run_start", user_id=user_id, stage=self.state["stage"], model=self.model.name,
                           limits=vars(self.limits), resumed=self.state["turns"] > 0)
 
@@ -66,19 +82,28 @@ class Agent:
         self.state["turns"] += 1
         self.tracer.turn = self.state["turns"]
         self.tracer.event("user_message", text=text)
+        if self.state.get("closed"):
+            # no parser, no reply model: a closed session costs nothing
+            self.tracer.event("input_rejected", reason="session_closed")
+            self.tracer.event("agent_reply", text=CLOSED_MESSAGE, stage=self.state["stage"])
+            self._save()
+            return CLOSED_MESSAGE
         if self.state["turns"] > self.limits.max_turns:
-            reply = self._limit_message(LimitExceeded("turns", self.limits.max_turns))
             self.tracer.event("limit_exceeded", kind="turns", limit=self.limits.max_turns)
+            reply = self._limit_message(LimitExceeded("turns", self.limits.max_turns)).replace(V, "")
             self.tracer.event("agent_reply", text=reply)
             self._save()
             return reply
-        return self._guarded(lambda: self._step(text))
+        return self._guarded(lambda: self._step(text), text)
 
-    def _guarded(self, fn) -> str:
+    def _guarded(self, fn, user_text: str = "") -> str:
         self.budget.start_turn()
         self._effects = []
+        self._turn_note = ""
         try:
             reply = fn()
+            if self._turn_note:
+                reply = self._turn_note + " " + reply
         except LimitExceeded as e:
             self.tracer.event("limit_exceeded", kind=e.kind, limit=e.limit)
             reply = self._limit_message(e)
@@ -91,10 +116,87 @@ class Agent:
             self.tracer.event("error", error=repr(e)[:300])
             reply = "Sorry, something unexpected went wrong on my side, so I stopped. " + self._status_summary()
         self._save()
-        self.tracer.event("agent_reply", text=reply, stage=self.state["stage"])
+        draft = reply
+        reply = self._phrase(user_text, reply)
+        self.tracer.event("agent_reply", text=reply, stage=self.state["stage"], facts=draft.replace(V, ""))
         self.tracer.event("turn_end", tool_calls=self.budget.tool_calls, model_calls=self.budget.model_calls,
                           elapsed_s=round(self.clock.monotonic() - self.budget.t0, 3))
         return reply
+
+    def _phrase(self, user_text: str, draft: str) -> str:
+        """Code decided the facts; the model writes the words. Verbatim parts are appended unchanged, so tables,
+        prices, slots and provider reviews never pass through the model. If the model can't be used (down, or
+        this turn's model-call limit is spent), the facts are sent as they are rather than leaving the user
+        without an answer."""
+        parts = draft.split(V)
+        prose = " ".join(p.strip() for p in parts[0::2] if p.strip())
+        blocks = [p.strip("\n") for p in parts[1::2] if p.strip()]
+        plain = "\n".join(p.strip("\n") for p in parts if p.strip())
+        if not self.phrase_replies or not prose or not hasattr(self.model, "compose"):
+            self._remember_turn(user_text, prose)
+            return plain
+        facts = prose + (" (Shown below this text, verbatim: " + str(len(blocks)) + " block(s) with the options, "
+                         "the exact action to confirm, or one-click choices.)" if blocks else "")
+        try:
+            self.budget.charge_model()
+            text, usage = self.model.compose(user_text, facts, history=self.state.get("history") or [],
+                                             state=self._reply_state())
+        except (ModelUnavailable, LimitExceeded) as e:
+            self.tracer.event("error", error=f"reply_not_phrased: {e}")
+            self._remember_turn(user_text, prose)
+            return plain
+        self.tracer.event("model_call", purpose="reply", **usage)
+        bad = self._reply_violation(text, plain)
+        if bad:
+            # the model added something code didn't decide (or leaked): send the facts as they are
+            self.tracer.event("reply_rejected", reason=bad, text=text[:300])
+            self._remember_turn(user_text, prose)
+            return plain
+        self._remember_turn(user_text, text)
+        return "\n".join([text] + blocks)
+
+    def _reply_violation(self, text: str, facts: str) -> str | None:
+        """Output guard for the reply model. Anything it may repeat must come from this turn's facts, the
+        request state or earlier replies; links other than Vaibhav's site and prompt/key leaks are refused."""
+        known = " ".join([facts, json.dumps(self._reply_state(), ensure_ascii=False)]
+                         + [h["agent"] for h in self.state.get("history") or []])
+        if "✅" in text and "✅" not in facts:
+            return "unearned_checkmark"
+        if any(b not in known for b in re.findall(r"BK-\d+", text)):
+            return "unknown_booking_id"
+        amounts = {int(a.replace(",", "")) for a in _AMOUNT.findall(known)}
+        r = self.state["request"]
+        amounts |= {int(r[k]) for k in ("budget",) if r.get(k)}
+        if any(int(a.replace(",", "")) not in amounts for a in _AMOUNT.findall(text)):
+            return "unknown_amount"
+        if any("vaibhavgeek.tech" not in u.lower() for u in _LINK.findall(text)):
+            return "foreign_link"
+        if _SECRET.search(text):
+            return "leak"
+        return None
+
+    HISTORY_TURNS = 6
+
+    def _remember_turn(self, user_text: str, agent_prose: str):
+        """Short history for the reply model. Only the agent's prose is kept: verbatim blocks (tables, provider
+        reviews) never reach the model, here or anywhere else."""
+        if not user_text or not agent_prose:
+            return
+        h = self.state.setdefault("history", [])
+        h.append({"user": user_text[:500], "agent": agent_prose[:800]})
+        del h[:-self.HISTORY_TURNS]
+        self._save()
+
+    def _reply_state(self) -> dict:
+        S, r = self.state, self.state["request"]
+        known = {k: r[k] for k in ("service", "area", "date_from", "date_to", "budget", "no_budget") if r.get(k)}
+        for k in ("time_start", "time_end"):
+            if r.get(k) is not None:
+                known[k] = fmt_min(r[k])
+        if r.get("provider"):
+            known["provider"] = r["provider"]["name"]
+        return {"stage": S["stage"], "intent": S["intent"], "city": CITY, "request": known,
+                "today": self.clock.now().strftime("%A %Y-%m-%d")}
 
     # ================= helpers =================
     def _save(self):
@@ -156,21 +258,53 @@ class Agent:
             return (f"That message is too long ({len(text)} characters; the limit is {MAX_MESSAGE_CHARS}). "
                     "Please send a shorter request. Nothing was changed.")
 
-        several = RuleBasedModel.errands(text)
-        if len(several) > 1:
-            self.tracer.event("input_rejected", reason="several_errands", errands=several)
-            return (f"That's more than one errand ({' and '.join(several)}). I handle one at a time so each gets its "
-                    "own confirmation. Which should I do first? Nothing was changed.")
+        attack = guard.screen(text)
+        if attack:
+            # caught in code before any model call, so the attempt costs no tokens
+            self.tracer.event("input_rejected", reason=attack)
+            return self._strike(attack)
 
-        p = self._parse(text)
+        sug = self._suggestion(text)
+        if sug is not None:
+            self.tracer.event("suggestion_click", label=sug["label"], updates=sug["updates"])
+            S["suggestions"] = []
+            self._merge(sug["updates"])
+            S["options"] = []
+            return self._advance()
+
+        try:
+            p = self._parse(text)
+        except ModelUnavailable as e:
+            self.tracer.event("error", error=f"model_unavailable: {e}")
+            return ("Sorry, I couldn't understand that just now because my language model isn't responding. "
+                    "Nothing was changed. Please try again in a moment.")
+
+        if p.off_topic:
+            self.tracer.event("input_rejected", reason="off_topic", by="parser")
+            if not (p.intent or p.slot_updates() or p.selection is not None):
+                return self._strike("off_topic")
+            # a real errand with an unrelated request attached: count it, drop that part, carry on
+            note = self._strike("off_topic", inline=True)
+            if self.state.get("closed"):
+                return note
+            self._turn_note = note
+
+        if p.errands and len(p.errands) > 1:
+            self.tracer.event("input_rejected", reason="several_errands", errands=p.errands)
+            return (f"That's more than one errand ({' and '.join(p.errands)}). I handle one at a time so each gets "
+                    "its own confirmation. Which should I do first? Nothing was changed.")
+
+        if p.area is None and p.unknown_area:
+            self.tracer.event("input_rejected", reason="unsupported_area", area=p.unknown_area)
+            return (f"I can only book in {CITY} for now, in these areas: {', '.join(AREAS)}. I haven't saved "
+                    "anything. Tell me one of those if it's right for you.")
+
+        if p.service is None and p.unknown_service:
+            self.tracer.event("input_rejected", reason="unsupported_service", service=p.unknown_service)
+            return f"The user asked for {p.unknown_service}. That is not a service you offer. Nothing was changed."
 
         if p.intent in ("memory_view", "memory_forget", "memory_set"):
             return self._memory_op(p)
-
-        if p.area is None and re.search(r"\b(my area is|i live in|i (have |'ve )?moved to|my address is)\b",
-                                        text.lower()):
-            return (f"I can only book in these areas: {', '.join(AREAS)}. I haven't saved anything. "
-                    "Tell me one of those if it's right for you.")
 
         if S.get("pending_memory"):
             pm, S["pending_memory"] = S["pending_memory"], None
@@ -206,10 +340,15 @@ class Agent:
             lr = S.get("last_result") or {}
             return f"That's already done ({lr.get('summary', 'completed')}). I won't do it again."
 
-        new_errand = (p.intent == "book" and S["intent"] == "book" and p.service
-                      and p.service != S["request"].get("service"))
+        # a different service in the middle of a booking: start over for it, keeping only the area, without asking
+        switch = (S["intent"] == "book" and stage not in ("idle", "done") and p.service
+                  and S["request"].get("service") and p.service != S["request"]["service"]
+                  and p.intent in (None, "book"))
+        if switch:
+            p.intent = "book"
+            return self._start_flow(p, switched_from=S["request"]["service"])
         if p.intent in ("book", "reschedule", "cancel") and (
-                p.intent != S["intent"] or stage in ("idle", "done") or new_errand):
+                p.intent != S["intent"] or stage in ("idle", "done")):
             return self._start_flow(p)
 
         if S["intent"] is None or stage in ("idle", "done"):
@@ -218,9 +357,9 @@ class Agent:
                 return self._start_flow(p)
             if is_affirmative(text) or is_negative(text):
                 return "There's nothing waiting for your confirmation right now. What can I help you with?"
-            return ("I can book, reschedule or cancel home services, e.g. 'Find a plumber in Indiranagar this "
-                    "week under ₹1,500', 'Move my AC servicing to Saturday' or 'Cancel my plumber booking'. "
-                    "I can also show or forget what I remember about you.")
+            return ("Nothing to act on: no request is in progress and this message isn't a booking, reschedule, "
+                    "cancel or memory request. Respond to what the user actually said, then say what you can help "
+                    "with. Nothing was changed.")
 
         if S["stage"] in ("choosing", "collecting") and is_negative(text) and not updates and p.selection is None:
             self._void("user stopped")
@@ -229,7 +368,13 @@ class Agent:
             return "OK, I've dropped that request. Nothing was booked or changed."
 
         if updates:
+            before = self._search_key()
             self._merge(updates)
+            if (S["stage"] in ("choosing", "collecting") and S["intent"] == "book"
+                    and S.get("last_search") == before == self._search_key()):
+                self.state["request"].pop("_note", None)
+                return self._not_understood()
+            S["suggestions"] = []
             if S["stage"] == "awaiting_approval":
                 self._transition("collecting", "request corrected")
             if S["intent"] == "book":
@@ -241,23 +386,96 @@ class Agent:
         if p.selection is not None and S["options"]:
             return self._select(p.selection)
 
-        if S["stage"] == "choosing":
-            return "Please pick an option by number, or tell me what to change.\n" + self._options_text()
+        if S["stage"] == "choosing" or (S["intent"] == "book" and S.get("last_search")
+                                        and S["last_search"] == self._search_key()):
+            return self._not_understood()
         return self._advance()
 
-    def _start_flow(self, p) -> str:
+    def _strike(self, category: str, inline: bool = False) -> str:
+        """Count an attempt to use the agent for something other than errands. Refusals are fixed text, shown
+        verbatim, so they cost no reply-model call; the MAX_STRIKES-th attempt closes the session."""
         S = self.state
+        S["strikes"] = n = S.get("strikes", 0) + 1
+        self.tracer.event("strike", category=category, count=n, limit=MAX_STRIKES)
+        if n >= MAX_STRIKES:
+            self._close(category)
+            return verbatim(f"I've closed this chat because it was used for things other than booking errands "
+                            f"{MAX_STRIKES} times. Nothing was booked, cancelled or changed, and your existing "
+                            "bookings are as they were. Start a New chat to book a service.")
+        warn = (" Please keep to errands: one more request like this and I'll close this chat."
+                if n == MAX_STRIKES - 1 else "")
+        if inline:
+            return "I've ignored the part of your message that isn't about errands." + warn
+        if category == "off_topic":
+            msg = (f"I can only help with booking home services in {CITY} ({SERVICES_LINE}) and with rescheduling "
+                   "or cancelling your bookings, so I can't help with that.")
+        else:
+            msg = (f"I can't do that. I only book home services in {CITY} ({SERVICES_LINE}) and manage your "
+                   "bookings, and I don't change how I work or share how I'm built. Nothing was changed.")
+        return verbatim(msg + (warn or " What service do you need?"))
+
+    def _close(self, reason: str):
+        S = self.state
+        self._void("session closed")
+        S.update({"intent": None, "request": {}, "options": [], "hold": None, "target": None,
+                  "pending_memory": None, "suggestions": [], "closed": True})
+        self._transition("idle", f"session closed ({reason})")
+
+    def _not_understood(self) -> str:
+        """Never silently repeat the same search: say so, and show what can be done."""
+        S = self.state
+        msg = "Sorry, I didn't understand that, so nothing has changed."
+        if S["options"]:
+            return msg + " Pick an option by number, or tell me what to change.\n" + self._options_text()
+        if S.get("suggestions"):
+            return msg + " Pick one of these, or tell me what to change.\n" + \
+                verbatim("Or say: " + " · ".join(x["label"] for x in S["suggestions"]))
+        return msg + " Tell me what to change, e.g. a different day, time or budget, or say 'search everything'."
+
+    def _suggestion(self, text: str):
+        S = self.state
+        if S["intent"] != "book" or S["stage"] not in ("choosing", "collecting"):
+            return None
+        t = text.strip().lower().rstrip(".!")
+        return next((x for x in S.get("suggestions") or [] if x["label"].lower() == t), None)
+
+    def _search_key(self) -> str:
+        skip = {"budget_asked", "pref_asked", "area_src", "provider_src"}
+        return json.dumps({k: v for k, v in self.state["request"].items() if not k.startswith("_") and k not in skip},
+                          sort_keys=True, default=str)
+
+    def _start_flow(self, p, switched_from: str | None = None) -> str:
+        S = self.state
+        old = S["request"]
+        keep = {k: old[k] for k in ("area", "area_src") if switched_from and old.get(k)}
         self._void("new request")
-        S.update({"intent": p.intent, "request": {}, "options": [], "hold": None, "target": None,
-                  "approval": None, "execution": None, "pending_memory": None})
+        S.update({"intent": p.intent, "request": keep, "options": [], "hold": None, "target": None,
+                  "approval": None, "execution": None, "pending_memory": None, "suggestions": [], "last_search": None})
         self._merge(p.slot_updates())
+        if switched_from:
+            r = S["request"]
+            # no "should I look for your last provider?" question either: the switch goes straight on
+            r["pref_asked"] = True
+            note = (f"Switched to {SERVICE_NAMES[p.service]}: I've dropped the {SERVICE_NAMES[switched_from]} "
+                    "request (nothing was booked)" + (f" and kept your area, {r['area']}" if keep and
+                                                       r.get("area") == keep["area"] else "") + ".")
+            r["_note"] = " ".join(x for x in (note, r.get("_note")) if x)
+            self.tracer.event("service_switch", **{"from": switched_from}, to=p.service, kept=sorted(keep))
         self._transition("collecting", f"new {p.intent} request")
         return self._advance()
 
     def _merge(self, updates: dict):
         r = self.state["request"]
+        updates = dict(updates)
+        relax = updates.pop("relax", None)
+        if relax:
+            self._relax(set(relax))
         for k, v in updates.items():
             r[k] = v
+        if "time_start" in updates or "time_end" in updates:
+            r.pop("any_time", None)
+        if updates.get("same_as_last"):
+            r.pop("any_provider", None)
         if "budget" in updates:
             r.pop("no_budget", None)
         if updates.get("no_budget"):
@@ -267,6 +485,30 @@ class Agent:
             if self.memory.usable("area") != updates["area"]:
                 self.memory.state("area", updates["area"])
                 r["_note"] = f"I'll remember {updates['area']} as your area (say 'forget my area' anytime)."
+
+    def _relax(self, relax: set):
+        """Drop the filters the user asked to widen. Explicit values in the same message are applied after this."""
+        r = self.state["request"]
+        if "all" in relax:
+            relax |= {"budget", "dates", "time", "provider"}
+            r["browse"] = True
+        if "budget" in relax:
+            r.pop("budget", None)
+            r["no_budget"] = True
+        if "time" in relax:
+            for k in ("time_start", "time_end", "time_exact"):
+                r.pop(k, None)
+            r["any_time"] = True
+        if "dates" in relax:
+            today = self.clock.now().date()
+            r["date_from"] = today.isoformat()
+            r["date_to"] = max(r.get("date_to") or "", (today + timedelta(days=6)).isoformat())
+        if "provider" in relax:
+            r.pop("provider", None)
+            r.pop("provider_src", None)
+            r.pop("same_as_last", None)
+            r["any_provider"] = True
+        self.tracer.event("relax", filters=sorted(relax))
 
     def _advance(self) -> str:
         intent = self.state["intent"]
@@ -307,7 +549,7 @@ class Agent:
 
     def _earliest(self):
         r = self.state["request"]
-        if r.get("time_exact"):
+        if r.get("time_exact") or r.get("any_time"):
             return None
         return self.memory.usable("earliest_time")
 
@@ -334,7 +576,7 @@ class Agent:
                     r["area"], r["area_src"] = b["area"], "history"
                 notes.append(f"Looking for {b['provider_name']}, who you booked on {fmt_slot(b['slot'])}.")
         svc = r.get("service")
-        if svc and not r.get("provider") and not r.get("pref_asked"):
+        if svc and not r.get("provider") and not r.get("pref_asked") and not r.get("any_provider"):
             key = f"preferred_provider:{svc}"
             f = self.memory.get(key)
             if f and f["source"] == "inferred" and not f["confirmed"]:
@@ -343,7 +585,7 @@ class Agent:
                 self._save()
                 return " ".join(notes + [f"Last time you booked {f['value']['name']} for {SERVICE_NAMES[svc]}. "
                                          f"Should I look for them again? (yes/no)"])
-            val = self.memory.usable(key)
+            val = None if r.get("any_provider") else self.memory.usable(key)
             if val:
                 r["provider"], r["provider_src"] = val, "memory"
                 notes.append(f"Using your preferred provider {val['name']}.")
@@ -351,7 +593,7 @@ class Agent:
         if not svc:
             missing.append("what service you need (plumber, electrician, AC servicing, cleaning, carpenter, pest control)")
         if not r.get("area"):
-            missing.append(f"your area ({', '.join(AREAS)})")
+            missing.append(f"your area in {CITY} ({', '.join(AREAS)})")
         if not r.get("date_from"):
             missing.append("when (e.g. 'tomorrow', 'this week', 'Saturday')")
         if r.get("budget") is None and not r.get("no_budget") and not r.get("budget_asked") and not r.get("provider"):
@@ -391,37 +633,80 @@ class Agent:
             start = max(start, e)
         return start, end
 
-    def _search_and_present(self) -> str:
-        S, r = self.state, self.state["request"]
-        results = self.tools.search_providers(r["service"], r["area"], [r["date_from"], r["date_to"]])
-        mine = {b["slot"] for b in self.tools.list_bookings() if b["status"] == "upcoming"}
-        start, end = self._window()
+    def _match(self, results, mine, drop: set):
+        """Providers with free slots that pass every filter except those in `drop` (time, budget, provider)."""
+        r = self.state["request"]
+        start, end = (0, 24 * 60) if "time" in drop else self._window()
         excluded = set(r.get("excluded", []))
         cands = []
         for p in results:
-            if r.get("provider") and p["id"] != r["provider"]["id"]:
+            if r.get("provider") and "provider" not in drop and p["id"] != r["provider"]["id"]:
                 continue
-            if r.get("budget") and p["price"] > r["budget"]:
+            if r.get("budget") and "budget" not in drop and p["price"] > r["budget"]:
                 continue
             slots = [s for s in p["free_slots"]
                      if start <= datetime.fromisoformat(s).hour * 60 < end and s not in mine and self._bookable(s)
                      and f"{p['id']}|{s}" not in excluded]
             if slots:
                 cands.append((p, slots))
-        cands.sort(key=lambda c: (-c[0]["rating"], c[0]["price"]))
-        options = [{"provider_id": p["id"], "provider_name": p["name"], "slot": s, "price": p["price"],
-                    "rating": p["rating"], "attributes": p["attributes"]}
-                   for p, slots in cands[:3] for s in slots[:2]]
-        if not options:
+        if "budget" in drop:
+            cands.sort(key=lambda c: (c[0]["price"], -c[0]["rating"]))
+        else:
+            cands.sort(key=lambda c: (-c[0]["rating"], c[0]["price"]))
+        return cands
+
+    def _constraints(self) -> str:
+        r = self.state["request"]
+        start, end = self._window()
+        when = (f"on {datetime.fromisoformat(r['date_from']).strftime('%a %d %b')}" if r["date_from"] == r["date_to"]
+                else f"between {r['date_from']} and {r['date_to']}")
+        cons = [f"in {r['area']}", when, f"from {fmt_min(start)} to {fmt_min(end)}" if (start, end) != (0, 1440) else ""]
+        if r.get("budget"):
+            cons.append(f"under {rupees(r['budget'])}")
+        return " ".join(c for c in cons if c)
+
+    def _search_and_present(self) -> str:
+        S, r = self.state, self.state["request"]
+        S["suggestions"] = []
+        results = self.tools.search_providers(r["service"], r["area"], [r["date_from"], r["date_to"]])
+        mine = {b["slot"] for b in self.tools.list_bookings() if b["status"] == "upcoming"}
+        S["last_search"] = self._search_key()
+        cands, drop = self._match(results, mine, set()), set()
+        today = self.clock.now().date()
+        week = (today.isoformat(), (today + timedelta(days=6)).isoformat())
+        narrow = r["date_from"] > week[0] or r["date_to"] < week[1]
+        if not cands:
+            # Work out which filter is blocking, from results we already have, before searching wider.
+            start, end = self._window()
+            active = {k for k, on in (("time", (start, end) != (0, 1440)), ("budget", bool(r.get("budget"))),
+                                      ("provider", bool(r.get("provider")))) if on}
+            tries = [d for d in ({"time"}, {"budget"}, {"time", "budget"}, {"provider"}, {"provider", "time", "budget"})
+                     if d <= active]
+            tries = [d for i, d in enumerate(tries) if d not in tries[:i]]
+            for d in tries:
+                cands = self._match(results, mine, d)
+                if cands:
+                    drop = d
+                    break
+            if not cands and narrow:
+                wide = self.tools.search_providers(r["service"], r["area"], list(week))
+                for d in [set()] + tries:
+                    cands = self._match(wide, mine, d)
+                    if cands:
+                        drop = d | {"dates"}
+                        break
+        if not cands:
             S["options"] = []
             self._transition("collecting", "no matching options")
             who = r["provider"]["name"] if r.get("provider") else f"{SERVICE_NAMES[r['service']]}s"
-            cons = [f"in {r['area']}", f"between {r['date_from']} and {r['date_to']}",
-                    f"from {fmt_min(start)} to {fmt_min(end)}" if (start, end) != (0, 1440) else ""]
-            if r.get("budget"):
-                cons.append(f"under {rupees(r['budget'])}")
-            return (f"I couldn't find any free {who} " + " ".join(c for c in cons if c) +
-                    ". Try widening the dates, time or budget.")
+            return (f"I couldn't find any free {who} {self._constraints()}" +
+                    (", and nothing at all is free there in the next 7 days." if narrow or r["date_to"] >= week[1]
+                     else ".") + " Try another area or a later week.")
+        per = 3 if r.get("browse") else 2
+        top = cands if r.get("browse") else cands[:3]
+        options = [{"provider_id": p["id"], "provider_name": p["name"], "slot": s, "price": p["price"],
+                    "rating": p["rating"], "attributes": p["attributes"]}
+                   for p, slots in top for s in slots[:per]]
         for pid in dict.fromkeys(o["provider_id"] for o in options):
             d = self.tools.get_provider(pid)
             safe = [rv["text"] for rv in d["reviews"] if not rv["flagged"]]
@@ -431,26 +716,103 @@ class Agent:
                     o["review"] = safe[0] if safe else None
                     o["flagged_reviews"] = flagged
         S["options"] = [dict(o, kind="new") for o in options]
-        self._transition("choosing", f"{len(options)} options found")
-        return self._options_text()
+        note = self._blocked_note(drop, cands) if drop else ""
+        S["suggestions"] = self._suggestions_for(drop, cands, narrow) if drop else []
+        self._transition("choosing", f"{len(options)} options found" + (f", relaxed {sorted(drop)}" if drop else ""))
+        if drop:
+            self.tracer.event("fallback", relaxed=sorted(drop), suggestions=[x["label"] for x in S["suggestions"]])
+        return (note + "\n" if note else "") + self._options_text(header=not note)
+
+    def _blocked_note(self, drop: set, cands) -> str:
+        r = self.state["request"]
+        who = r["provider"]["name"] if r.get("provider") else f"{SERVICE_NAMES[r['service']]}s"
+        parts = [f"I couldn't find any free {who} {self._constraints()}."]
+        if "budget" in drop:
+            p = min((c[0] for c in cands), key=lambda p: p["price"])
+            parts.append(f"The cheapest available is {p['name']} at {rupees(p['price'])}.")
+        if "time" in drop:
+            parts.append("There are free slots at other times of day.")
+        if "provider" in drop:
+            parts.append(f"{r['provider']['name']} has nothing free, but other providers do.")
+        if "dates" in drop:
+            parts.append("Those days are full, but there are free slots later this week.")
+        parts.append("Here's what you can book instead:")
+        return " ".join(parts)
+
+    def _suggestions_for(self, drop: set, cands, narrow: bool) -> list:
+        """One-click changes. Clicking one is handled in code, with no model call."""
+        r = self.state["request"]
+        out = []
+        if "budget" in drop:
+            cheapest = min(c[0]["price"] for c in cands)
+            out.append({"label": f"Raise budget to {rupees(cheapest)}", "updates": {"budget": cheapest}})
+            out.append({"label": "No budget limit", "updates": {"relax": ["budget"]}})
+        if "time" in drop:
+            out.append({"label": "Any time of day", "updates": {"relax": ["time"]}})
+        if "provider" in drop:
+            out.append({"label": "Any provider", "updates": {"relax": ["provider"]}})
+        if narrow:
+            out.append({"label": "Look at other days", "updates": {"relax": ["dates"]}})
+        if not r.get("browse"):
+            out.append({"label": "Show everything", "updates": {"relax": ["all"]}})
+        return out
+
+    def option_labels(self) -> list:
+        """Human labels for the options currently shown, e.g. for echoing the user's click in the UI."""
+        S, out = self.state, []
+        svc = SERVICE_NAMES.get(S["request"].get("service") or (S.get("target") or {}).get("service"), "")
+        for o in S["options"]:
+            if o["kind"] == "booking":
+                b = o["booking"]
+                out.append(f"{SERVICE_NAMES[b['service']]} with {b['provider_name']}, {fmt_slot(b['slot'])}")
+            elif o["kind"] == "slot":
+                out.append(f"{svc} with {S['target']['provider_name']}, {fmt_slot(o['slot'])}".strip())
+            else:
+                out.append(f"{svc} with {o['provider_name']}, {fmt_slot(o['slot'])} ({rupees(o['price'])})".strip())
+        return [s[:1].upper() + s[1:] for s in out]
 
     def _options_text(self, header: bool = True) -> str:
-        lines = []
-        for i, o in enumerate(self.state["options"], 1):
-            if o["kind"] == "new":
-                line = (f"{i}. {o['provider_name']} — ★{o['rating']} — {rupees(o['price'])} — {fmt_slot(o['slot'])}"
-                        f" ({', '.join(o['attributes'])})")
-                if o.get("review"):
-                    line += f'\n   Review: "{o["review"]}"'
-                if o.get("flagged_reviews"):
-                    line += f"\n   ({o['flagged_reviews']} review withheld: it contained instructions aimed at AI agents)"
-            elif o["kind"] == "booking":
-                b = o["booking"]
-                line = f"{i}. {SERVICE_NAMES[b['service']]} with {b['provider_name']} on {fmt_slot(b['slot'])} ({rupees(b['price'])}) [{b['id']}]"
-            else:
-                line = f"{i}. {fmt_slot(o['slot'])}"
-            lines.append(line)
-        return ("Here are your options:\n" if header else "") + "\n".join(lines) + "\nReply with an option number."
+        S = self.state
+        opts = S["options"]
+        if opts and all(o["kind"] == "new" for o in opts):
+            body, tail = self._options_table(opts), "Reply with a slot number to book it."
+        else:
+            lines = []
+            for i, o in enumerate(opts, 1):
+                if o["kind"] == "booking":
+                    b = o["booking"]
+                    lines.append(f"{i}. {SERVICE_NAMES[b['service']]} with {b['provider_name']} on {fmt_slot(b['slot'])} "
+                                 f"({rupees(b['price'])}) [{b['id']}]")
+                else:
+                    lines.append(f"{i}. {fmt_slot(o['slot'])}")
+            body, tail = "\n".join(lines), "Reply with an option number."
+        out = ("Here are your options:\n" if header else "") + verbatim(body) + "\n" + tail
+        if S.get("suggestions"):
+            out += "\n" + verbatim("Or say: " + " · ".join(x["label"] for x in S["suggestions"]))
+        return out
+
+    @staticmethod
+    def _options_table(opts) -> str:
+        cell = lambda x: str(x).replace("|", "/").replace("\n", " ")
+        days = {o["slot"][:10] for o in opts}
+        one_day = len(days) == 1
+        groups: dict = {}
+        for i, o in enumerate(opts, 1):
+            groups.setdefault(o["provider_id"], []).append((i, o))
+        rows = ["| Provider | Rating | Price | Free slots | Reviews |", "|---|---|---|---|---|"]
+        for items in groups.values():
+            o = items[0][1]
+            slots = " · ".join(f"[{i}] " + (fmt_min(datetime.fromisoformat(x["slot"]).hour * 60
+                                                    + datetime.fromisoformat(x["slot"]).minute)
+                                            if one_day else fmt_slot(x["slot"]).replace(",", ""))
+                               for i, x in items)
+            name = cell(o["provider_name"]) + (f" ({cell(', '.join(o['attributes']))})" if o.get("attributes") else "")
+            # brackets out of review text: "[n]" in a cell is a slot button in the web console. Reviews flagged as
+            # injection attempts are dropped silently (sanitize.py).
+            review = f'"{cell(o["review"]).replace("[", "(").replace("]", ")")}"' if o.get("review") else "—"
+            rows.append(f"| {name} | ★{o['rating']} | {rupees(o['price'])} | {slots} | {review} |")
+        head = f"All slots are on {datetime.fromisoformat(opts[0]['slot']).strftime('%a %d %b')}.\n" if one_day else ""
+        return head + "\n".join(rows)
 
     def _select(self, idx: int) -> str:
         S, r = self.state, self.state["request"]
@@ -509,7 +871,7 @@ class Agent:
             old = self.state["target"]["slot"]
             what = (f"RESCHEDULE booking {ap['booking_id']} with {ap['provider_name']} from {fmt_slot(old)} "
                     f"to {fmt_slot(ap['slot'])} (price {rupees(ap['price'])})")
-        return f"Please confirm: {what}. Reply 'yes' to confirm or 'no' to stop."
+        return verbatim(f"Please confirm: {what}.") + " Reply 'yes' to confirm or 'no' to stop."
 
     def _grant_and_execute(self) -> str:
         S = self.state
@@ -592,9 +954,11 @@ class Agent:
         self._effects.append(summary)
         self._transition("done", "booking verified")
         msg = f"✅ Booked and verified with the provider — {summary}."
-        if self.memory.infer(f"preferred_provider:{r['service']}",
-                             {"id": ap["provider_id"], "name": ap["provider_name"]}, evidence=booking_id):
-            msg += (f" (I've noted {ap['provider_name']} as a possible favourite; I'll ask before using that.)")
+        if self.memory.booked(f"preferred_provider:{r['service']}",
+                              {"id": ap["provider_id"], "name": ap["provider_name"]}, booking_id):
+            msg += (f" I've saved {ap['provider_name']} as your preferred {SERVICE_NAMES[r['service']]} provider and "
+                    "will look for them first next time. Say 'any provider' then, or 'forget my preferred "
+                    f"{SERVICE_NAMES[r['service']]}', to change that.")
         return msg
 
     # ================= cancel / reschedule =================
@@ -631,8 +995,10 @@ class Agent:
             S["target"] = t
         t = S["target"]
         if not r.get("date_from"):
-            self._transition("collecting", "need new date")
-            return f"When would you like to move your {SERVICE_NAMES[t['service']]} ({fmt_slot(t['slot'])}) to?"
+            # no day given: offer what the provider has free over the next week
+            today = self.clock.now().date()
+            r["date_from"], r["date_to"] = today.isoformat(), (today + timedelta(days=6)).isoformat()
+            r["next_free"] = True
         past = self._past_dates()
         if past:
             return past
@@ -651,14 +1017,21 @@ class Agent:
                  and s != t["slot"] and f"{t['provider_id']}|{s}" not in excluded and self._bookable(s)]
         if not slots:
             self._transition("collecting", "no reschedule slots")
+            if r.pop("next_free", None):
+                r.pop("date_from", None), r.pop("date_to", None)
+                return (f"{t['provider_name']} has no free slots in the next 7 days. Tell me a later day to move your "
+                        f"{SERVICE_NAMES[t['service']]} ({fmt_slot(t['slot'])}) to.")
             return (f"{t['provider_name']} has no free slots between {r['date_from']} and {r['date_to']}"
                     f" in that time window. Try another day or time.")
         if r.get("time_exact") and len(slots) == 1:
             return self._propose("reschedule", t["provider_id"], t["provider_name"], slots[0], t["price"],
                                  booking_id=t["id"])
-        S["options"] = [{"kind": "slot", "slot": s} for s in slots[:4]]
+        week = r.pop("next_free", None)
+        S["options"] = [{"kind": "slot", "slot": s} for s in slots[:6 if week else 4]]
         self._transition("choosing", "reschedule slots found")
-        return f"{t['provider_name']} is free at these times:\n" + self._options_text(header=False)
+        when = " in the next 7 days" if week else ""
+        return (f"Moving your {SERVICE_NAMES[t['service']]} from {fmt_slot(t['slot'])}. {t['provider_name']} is free "
+                f"at these times{when}. Pick one, or tell me another day or time.\n" + self._options_text(header=False))
 
     def _exec_cancel(self) -> str:
         S = self.state
