@@ -89,6 +89,31 @@ def _openai(outputs):
 CTX = {"today": date(2026, 11, 1), "stage": "idle", "n_options": 0}
 
 
+def test_same_day_resolves_to_the_day_already_named():
+    today = date(2026, 11, 1)
+    assert resolve_when("same_day", today, ("2026-11-06", "2026-11-06")) == ("2026-11-06", "2026-11-06")
+    assert resolve_when("same day", today) == ("2026-11-01", "2026-11-01")  # nothing named yet: same-day = today
+    p, dropped = Parsed.from_dict({"when": "same_day"}, today, ("2026-11-06", "2026-11-06"))
+    assert (p.date_from, p.date_to) == ("2026-11-06", "2026-11-06") and not dropped
+
+
+def test_service_switch_keeps_the_day_and_same_day_works(tmp_path):
+    """AC on Friday -> 'no, plumbing' keeps Whitefield and Friday; 'same day' still means Friday."""
+    outs = [{"intent": "book", "service": "ac_service"}, {"area": "Whitefield"}, {"when": "friday"},
+            {"service": "plumber"}, {"when": "same_day"}]
+    m, sent = _openai(outs)
+    w = World(tmp_path, model=m)
+    r = w.say("I want to book ac service", "Whitefield", "friday", "no, plumbing")
+    req = w.agent.state["request"]
+    assert req["service"] == "plumber" and (req["date_from"], req["date_to"]) == ("2026-11-06", "2026-11-06")
+    assert "kept your area, Whitefield and the same day, Friday 06 Nov" in r[-1] and "when (" not in r[-1]
+    assert "Day already named in this conversation: Friday 06 Nov (2026-11-06)" in sent[-1]["messages"][0]["content"]
+    w.say("same day")
+    assert w.agent.state["request"]["date_from"] == "2026-11-06"
+    assert w.calls("search_providers")[-1] == {"service": "plumber", "area": "Whitefield",
+                                                "date_range": ["2026-11-06", "2026-11-06"]}
+
+
 def test_openai_output_is_schema_validated_and_dates_owned_by_code():
     m, sent = _openai([{"intent": "book", "service": "electrician", "approved": True, "selection": "2",
                         "area": "Mars", "when": "tomorrow", "date_from": "2026-11-01", "date_to": "2026-11-01"}])

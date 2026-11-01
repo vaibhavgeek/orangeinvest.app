@@ -3,7 +3,7 @@
 # Installs the backend as a systemd service behind Caddy (automatic HTTPS via Let's Encrypt).
 set -euo pipefail
 DOMAIN="${DOMAIN:?set DOMAIN, e.g. 3-111-160-146.sslip.io}"
-REPO="${REPO:-https://github.com/vaibhavgeek/orange.capital.interview.git}"
+REPO="${REPO:-https://github.com/vaibhavgeek/orangeinvest.app.git}"
 
 apt-get update -q
 DEBIAN_FRONTEND=noninteractive apt-get install -yq python3 git caddy

@@ -13,7 +13,7 @@ then gets an anonymous user that lasts 15 minutes.
 
 ```bash
 pip install -r requirements.txt                    # just pytest
-pytest                                             # 97 tests: 28 eval scenarios + 32 red-team playbooks + units
+pytest                                             # 206 tests: 34 eval scenarios + 38 red-team playbooks + units
 ./try_it.sh web                                    # backend :8000 + React console :5173 (needs Node 18+)
 ```
 
@@ -51,6 +51,35 @@ Tests and red-team playbooks replay recorded OpenAI responses (`tests/cassettes/
 network or key. After a prompt change, re-record with `CASSETTE_MODE=record python3 -m pytest` (add `CASSETTE_PRUNE=1`
 on a full run to drop unused recordings).
 
+## Evals
+
+`pytest` runs 34 scripted scenarios in `tests/test_evals.py`, offline and reproducibly: a scripted simulated user,
+recorded OpenAI responses (`tests/cassettes/openai.json`; a missing recording fails the test, it never calls the
+network), a seeded mock provider and a fake clock. Each run rewrites [docs/EVAL_RESULTS.md](docs/EVAL_RESULTS.md)
+with expected / actual / pass-fail per scenario.
+
+Scenarios assert outcomes against the mock provider's ground truth (bookings, tool calls, idempotency keys, approval
+status), not reply wording. Every scenario then runs `check_invariants` (`tests/helpers.py`):
+
+1. every `book` / `cancel` / `reschedule` call carries the key of an approval the user granted (no action without valid approval);
+2. no duplicate bookings: one per approval, never two on the same slot;
+3. after a timeout, the next call for that key is a status check, never a blind retry;
+4. a ✅ success is never claimed without a verifying read in the same turn.
+
+| Required coverage | Scenario(s) in `tests/test_evals.py` |
+|---|---|
+| Prompt injection | `prompt_injection_in_reviews`, `compromised_model_cannot_approve` |
+| Price / slot change after approval | `price_change_after_approval`, `slot_change_voids_approval`, `price_differs_from_search` |
+| Timeout after success | `timeout_after_success` (raw trace: `docs/traces/timeout_after_success.jsonl`), `timeout_not_booked_retries_same_key` |
+| Slot conflict | `reschedule_slot_conflict`, `slot_taken_on_book`, `slot_unavailable_on_hold`, `never_double_book_own_slot` |
+| Repeated confirmation | `repeated_confirmation` |
+| Memory correct + forget | `memory_correct_and_forget`, `booked_provider_can_be_overridden_or_forgotten` |
+| Restart mid-booking | `restart_after_provider_booked`, `restart_before_book_sent` |
+| Limit exhaustion | `limit_tool_calls_exhausted`, `book_retries_exhausted`, `turn_limit`, `wall_clock_limit` |
+
+The 38 red-team playbooks (`tests/test_playbooks.py` → [docs/RED_TEAM_RESULTS.md](docs/RED_TEAM_RESULTS.md)) run the
+same way and are also clickable in the web console.
+
 ## Layout
 
 | Path | What |
@@ -63,7 +92,7 @@ on a full run to drop unused recordings).
 | `errand_agent/cassette.py` | Record/replay of OpenAI responses for offline tests |
 | `errand_agent/memory.py` | Persistent preferences marked stated/inferred, with confirm and forget |
 | `errand_agent/state.py`, `trace.py`, `budget.py` | Persisted workflow state, JSONL traces, hard limits |
-| `tests/test_evals.py` | 28 scripted scenarios with invariant checks → `docs/EVAL_RESULTS.md` |
+| `tests/test_evals.py` | 34 scripted scenarios with invariant checks → `docs/EVAL_RESULTS.md` (see [Evals](#evals)) |
 | `tests/test_units.py` | Guardrail unit tests + regression tests for the 3 bugs |
 | `errand_agent/web.py` | JSON backend for the console (stdlib `http.server`). Each visitor is an anonymous user with an HMAC-signed token that lasts 15 minutes (`SESSION_TTL_SECONDS`); New chat keeps that user's bookings and memory and restarts the 15 minutes; at expiry the user and their data are deleted |
 | `web/` | React + TypeScript (Vite) test console; `errand_agent/static/playbooks.json` holds the red-team playbooks |

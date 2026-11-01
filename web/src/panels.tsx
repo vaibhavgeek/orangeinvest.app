@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { Booking, MemoryFact, Playbook, Snapshot, Step, TraceEvent } from "./api";
+import { api, type Booking, type MemoryFact, type Playbook, type Snapshot, type Step, type TraceEvent } from "./api";
 
 const STAGES = ["idle", "collecting", "choosing", "awaiting_approval", "executing", "done"];
 const BAD = new Set(["error", "limit_exceeded", "approval_blocked", "input_rejected"]);
@@ -58,12 +58,25 @@ function EventRow({ e }: { e: TraceEvent }) {
 
 export function TracePane({ events }: { events: TraceEvent[] }) {
   const [hide, setHide] = useState(true);
+  const [copied, setCopied] = useState("");
   const shown = hide ? events.filter((e) => e.type !== "run_start" && e.type !== "turn_end") : events;
+  const copy = async () => {
+    try {
+      const { text } = await api<{ text: string }>("/api/trace/export");
+      await navigator.clipboard.writeText(text + "\n\nThis is the trace for the conversation above, please fix: ");
+      setCopied("Copied ✓");
+    } catch (err) {
+      setCopied("Copy failed: " + (err instanceof Error ? err.message : String(err)));
+    }
+    setTimeout(() => setCopied(""), 2500);
+  };
   return (
     <>
       <div className="bar">
         <label><input type="checkbox" checked={hide} onChange={(e) => setHide(e.target.checked)} /> hide run_start / turn_end</label>
         <span className="spacer" /><span>click a row for the full JSON</span>
+        <button disabled={events.length === 0} onClick={copy}
+          title="Copy the conversation, prompts and full trace, ready to paste into Claude Code">{copied || "Copy trace"}</button>
       </div>
       {shown.length === 0 && <div className="muted">No events yet. Send a message.</div>}
       {shown.map((e) => <EventRow key={e.seq} e={e} />)}

@@ -169,6 +169,11 @@
    "steps": ["Find a plumber in Indiranagar this week, mornings only, under ₹1,500", "1", "actually I need an electrician tomorrow, no budget"],
    "expect": {"new_bookings": 0, "stage": "choosing", "reply_contains": ["Switched to electrician", "kept your area, Indiranagar"]}},
 
+  {"id": "switch-service-same-day", "group": "Messy input", "title": "Switch service, then 'same day'",
+   "why": "AC on Friday, then 'no, plumbing': the switch keeps the area and Friday, and 'same day' means that Friday, not a fresh 'when?'.",
+   "steps": ["I want to book ac service", "Whitefield", "friday, no budget", "no, plumbing", "same day"],
+   "expect": {"new_bookings": 0, "stage": "choosing", "reply_not": ["When would you like"]}},
+
   {"id": "hinglish", "group": "Messy input", "title": "Hinglish booking and confirmation",
    "why": "'kal subah', 'Indira Nagar', '1500 tak' and 'haan book kar do' are understood like their English versions.",
    "steps": ["kal subah Indira Nagar mein plumber chahiye, 1500 tak", "1", "haan book kar do"],

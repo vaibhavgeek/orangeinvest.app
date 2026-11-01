@@ -28,7 +28,7 @@ from .budget import Limits
 from .cli import SCENARIOS, load_dotenv
 from .clock import SystemClock
 from .mock_api import MockProviderAPI, Scenario, SimulatedCrash
-from .nlu import OpenAIModel
+from .nlu import REPLY_PROMPT, OpenAIModel, extraction_prompt
 
 DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "dist")
 PLAYBOOKS = os.path.join(os.path.dirname(__file__), "static", "playbooks.json")
@@ -199,6 +199,31 @@ class App:
         return {"reply": f"⏩ Clock moved forward {minutes} minutes (now {self.clock.now():%a %d %b %H:%M}).",
                 "system": True}
 
+    def trace_export(self) -> dict:
+        """Everything needed to debug this chat in one paste: the conversation, both system prompts and the raw
+        trace. The parser prompt's last line changes every turn; each parse MODEL row carries its own copy."""
+        rows = []
+        if os.path.exists(self.trace_path):
+            with open(self.trace_path) as f:
+                rows = [json.loads(r) for r in f if r.strip()]
+        chat = []
+        for e in rows:
+            if e["type"] == "user_message":
+                chat.append(f"[t{e['turn']}] USER: {e['text']}")
+            elif e["type"] == "agent_reply":
+                chat.append(f"[t{e['turn']}] AGENT: {e['text']}")
+        parts = [
+            f"# Errand Agent trace — session {self.session_id}, model {self.agent.model.name}, "
+            f"stage {self.agent.state['stage']}, clock {self.clock.now():%a %d %b %Y %H:%M}",
+            "## Conversation", "\n".join(chat) or "(no messages yet)",
+            "## Parser system prompt (last line = this turn's context; per-turn copies are in the MODEL parse rows)",
+            extraction_prompt(self.agent.parse_ctx()),
+            "## Reply-model system prompt", REPLY_PROMPT,
+            "## Current request state", json.dumps(self.agent.state["request"], ensure_ascii=False, default=str),
+            f"## Trace ({len(rows)} events, JSONL)", "\n".join(json.dumps(e, ensure_ascii=False) for e in rows),
+        ]
+        return {"text": "\n\n".join(parts)}
+
     def snapshot(self, since: int) -> dict:
         S = self.agent.state
         now = self.clock.now()
@@ -352,6 +377,10 @@ def make_handler(hub: Hub):
                 if self.path in ("/api/playbooks", "/playbooks.json"):
                     with open(PLAYBOOKS, "rb") as f:
                         return self._send(200, f.read())
+                if self.path == "/api/trace/export":
+                    app = self._app()
+                    with app.lock:
+                        return self._send(200, app.trace_export())
                 if self.path.startswith("/api/state"):
                     since = 0
                     if "since=" in self.path:

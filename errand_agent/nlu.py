@@ -65,8 +65,9 @@ class Parsed:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict, today: date | None = None):
-        """Strict validation of model output. Returns (Parsed, dropped_keys)."""
+    def from_dict(cls, d: dict, today: date | None = None, anchor: tuple | None = None):
+        """Strict validation of model output. Returns (Parsed, dropped_keys). `anchor` is the (date_from, date_to)
+        the conversation already named; 'same_day' resolves to it."""
         known = {f.name for f in fields(cls)} - set(CODE_ONLY)
         dropped = [k for k in d if k not in known]
         p = cls()
@@ -86,7 +87,7 @@ class Parsed:
             if k in ("unknown_area", "unknown_service", "memory_key") and not isinstance(v, str):
                 dropped.append(k); continue
             if k == "when":
-                if not isinstance(v, str) or (today and resolve_when(v, today) is None):
+                if not isinstance(v, str) or (today and resolve_when(v, today, anchor) is None):
                     dropped.append(k); continue
             if k in ("time_start", "time_end", "budget", "selection"):
                 if not isinstance(v, int) or isinstance(v, bool) or v < 0:
@@ -107,8 +108,9 @@ class Parsed:
                 dropped.append(k); continue
             setattr(p, k, v)
         if p.when and today:
-            p.date_from, p.date_to = resolve_when(p.when, today)
-        if p.memory_key == "area" and p.memory_value not in AREAS:  # "my area is Mars" is never saved
+            p.date_from, p.date_to = resolve_when(p.when, today, anchor)
+        if p.memory_key == "area" and p.intent != "memory_forget" and p.memory_value not in AREAS:
+            # "my area is Mars" is never saved ("forget my area" has no value and is fine)
             p.unknown_area = p.unknown_area or (str(p.memory_value) if p.memory_value else None)
             if p.intent == "memory_set":
                 p.intent = None
@@ -117,10 +119,13 @@ class Parsed:
         return p, dropped
 
 
-def resolve_when(when: str, today: date):
-    """Turn the model's day phrase into an ISO (date_from, date_to) pair. None if it isn't in the vocabulary."""
+def resolve_when(when: str, today: date, anchor: tuple | None = None):
+    """Turn the model's day phrase into an ISO (date_from, date_to) pair. None if it isn't in the vocabulary.
+    'same_day' is the day(s) already named in the conversation (`anchor`); with none, it means today."""
     w = when.strip().lower().replace(" ", "_")
     one = lambda d: (d.isoformat(), d.isoformat())
+    if w == "same_day":
+        return tuple(anchor) if anchor else one(today)
     fixed = {"today": 0, "tomorrow": 1, "day_after_tomorrow": 2, "yesterday": -1}
     if w in fixed:
         return one(today + timedelta(days=fixed[w]))
@@ -163,10 +168,7 @@ def resolve_when(when: str, today: date):
 
 def extraction_prompt(ctx: dict) -> str:
     """System prompt. Static rules first (cacheable prefix), then today's calendar and the conversation stage."""
-    today: date = ctx["today"]
     schema = {f.name: str(f.type) for f in fields(Parsed) if f.name not in CODE_ONLY}
-    calendar = ", ".join(f"{(today + timedelta(days=i)).strftime('%A')} {(today + timedelta(days=i)).isoformat()}"
-                         + (" (today)" if i == 0 else " (tomorrow)" if i == 1 else "") for i in range(8))
     return (
         f"You extract structured fields from ONE user message for Errand Agent, a home-services booking assistant "
         f"in {CITY}. "
@@ -186,7 +188,9 @@ def extraction_prompt(ctx: dict) -> str:
         "- when names the day(s); never compute dates yourself. Use exactly one of: today, tomorrow, "
         "day_after_tomorrow, yesterday, this_week, next_week, weekend, next_N_days (e.g. next_3_days), a weekday "
         "(monday ... sunday = the next one, today included), next_<weekday> (e.g. next_friday), or MM-DD for a "
-        "named calendar day without a year ('15 oct' -> '10-15', '5th Jan' -> '01-05').\n"
+        "named calendar day without a year ('15 oct' -> '10-15', '5th Jan' -> '01-05'), or same_day for 'same "
+        "day' / 'same date' / 'that day' / 'the same day as before' / 'wahi din' (the day already named in this "
+        "conversation; code looks it up).\n"
         "- Times are integer minutes after midnight. mornings = 480-720, afternoons = 720-1020, evenings = "
         "1020-1200. An exact time like 'at 11am' gives time_start=660, time_end=720, time_exact=true. "
         "'after 2' / 'not before 2pm' gives time_start=840 only. 'before 11am' gives time_end=660 only.\n"
@@ -253,6 +257,7 @@ def extraction_prompt(ctx: dict) -> str:
         "'cancel my booking' -> {\"intent\":\"cancel\"}\n"
         "'move it to Friday afternoon' -> {\"intent\":\"reschedule\",\"when\":\"friday\",\"time_start\":720,"
         "\"time_end\":1020}\n"
+        "'same day' -> {\"when\":\"same_day\"}\n"
         "'yes' -> {}\n"
         "'kal subah Indira Nagar mein plumber chahiye, 1500 tak' -> {\"intent\":\"book\",\"service\":\"plumber\","
         "\"area\":\"Indiranagar\",\"when\":\"tomorrow\",\"time_start\":480,\"time_end\":720,\"budget\":1500}\n"
@@ -265,9 +270,18 @@ def extraction_prompt(ctx: dict) -> str:
         "'mujhe ek joke sunao' -> {\"off_topic\":true}\n"
         "'hi, what can you do?' -> {}\n"
         "Reply with the JSON object only.\n"
-        f"Today is {today.isoformat()} ({today.strftime('%A')}). Calendar: {calendar}. "
-        f"Conversation stage: {ctx.get('stage')}. Options currently shown to the user: {ctx.get('n_options', 0)}."
+        + context_line(ctx)
     )
+
+
+def context_line(ctx: dict) -> str:
+    """The per-turn tail of the parser prompt (the rest is static)."""
+    today: date = ctx["today"]
+    calendar = ", ".join(f"{(today + timedelta(days=i)).strftime('%A')} {(today + timedelta(days=i)).isoformat()}"
+                         + (" (today)" if i == 0 else " (tomorrow)" if i == 1 else "") for i in range(8))
+    return (f"Today is {today.isoformat()} ({today.strftime('%A')}). Calendar: {calendar}. "
+            f"Conversation stage: {ctx.get('stage')}. Options currently shown to the user: {ctx.get('n_options', 0)}. "
+            f"Day already named in this conversation: {ctx.get('anchor_label') or 'none'}.")
 
 
 REPLY_PROMPT = (
@@ -386,7 +400,7 @@ class OpenAIModel:
                 raise ValueError("model output is not a JSON object")
         except Exception as e:
             raise ModelUnavailable(repr(e)[:160]) from e
-        p, dropped = Parsed.from_dict(data, ctx["today"])
+        p, dropped = Parsed.from_dict(data, ctx["today"], ctx.get("anchor"))
         u = resp.get("usage", {})
         n_in, n_out = u.get("prompt_tokens", 0), u.get("completion_tokens", 0)
         usage = {"model": self.name, "input_tokens": n_in, "output_tokens": n_out,

@@ -11,7 +11,7 @@ from .budget import Budget, LimitExceeded, Limits
 from .clock import SystemClock
 from .memory import MemoryStore, label, show_value
 from .mock_api import AREAS, CITY, ToolError, ToolTimeout
-from .nlu import SERVICE_NAMES, ModelUnavailable, OpenAIModel
+from .nlu import SERVICE_NAMES, ModelUnavailable, OpenAIModel, context_line
 from .state import StateStore, new_state
 from .tools import ToolGateway
 
@@ -41,6 +41,11 @@ def fmt_slot(slot: str) -> str:
 
 def fmt_min(m: int) -> str:
     return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def fmt_dates(date_from: str, date_to: str) -> str:
+    a, b = (datetime.fromisoformat(d).strftime("%A %d %b (%Y-%m-%d)") for d in (date_from, date_to))
+    return a if date_from == date_to else f"{a} to {b}"
 
 
 def rupees(n) -> str:
@@ -229,12 +234,22 @@ class Agent:
                 "wall_clock_seconds": f"{e.limit:g} seconds"}.get(e.kind, str(e.limit))
         return f"I stopped because this step hit its safety limit ({desc}). " + self._status_summary()
 
+    def parse_ctx(self) -> dict:
+        ctx = {"today": self.clock.now().date(), "stage": self.state["stage"], "n_options": len(self.state["options"])}
+        r = self.state["request"]
+        anchor = (r["date_from"], r["date_to"]) if r.get("date_from") else self.state.get("prev_dates")
+        if anchor:
+            ctx["anchor"] = tuple(anchor)
+            ctx["anchor_label"] = fmt_dates(*anchor)
+        return ctx
+
     def _parse(self, text: str):
         self.budget.charge_model()
-        ctx = {"today": self.clock.now().date(), "stage": self.state["stage"], "n_options": len(self.state["options"])}
+        ctx = self.parse_ctx()
         p, usage, dropped = self.model.parse(text, ctx)
         out = {k: v for k, v in vars(p).items() if v not in (None, False)}
-        self.tracer.event("model_call", **usage, output=out, dropped_fields=dropped)
+        self.tracer.event("model_call", **usage, purpose="parse", prompt_context=context_line(ctx), output=out,
+                          dropped_fields=dropped)
         return p
 
     def _void(self, reason: str):
@@ -418,7 +433,7 @@ class Agent:
         S = self.state
         self._void("session closed")
         S.update({"intent": None, "request": {}, "options": [], "hold": None, "target": None,
-                  "pending_memory": None, "suggestions": [], "closed": True})
+                  "pending_memory": None, "suggestions": [], "closed": True, "prev_dates": None})
         self._transition("idle", f"session closed ({reason})")
 
     def _not_understood(self) -> str:
@@ -447,7 +462,9 @@ class Agent:
     def _start_flow(self, p, switched_from: str | None = None) -> str:
         S = self.state
         old = S["request"]
-        keep = {k: old[k] for k in ("area", "area_src") if switched_from and old.get(k)}
+        keep = {k: old[k] for k in ("area", "area_src", "date_from", "date_to") if switched_from and old.get(k)}
+        if old.get("date_from"):  # what "same day" refers to in the next request
+            S["prev_dates"] = [old["date_from"], old["date_to"]]
         self._void("new request")
         S.update({"intent": p.intent, "request": keep, "options": [], "hold": None, "target": None,
                   "approval": None, "execution": None, "pending_memory": None, "suggestions": [], "last_search": None})
@@ -456,9 +473,14 @@ class Agent:
             r = S["request"]
             # no "should I look for your last provider?" question either: the switch goes straight on
             r["pref_asked"] = True
+            kept = []
+            if keep.get("area") and r.get("area") == keep["area"]:
+                kept.append(f"your area, {r['area']}")
+            if keep.get("date_from") and (r.get("date_from"), r.get("date_to")) == (keep["date_from"], keep["date_to"]):
+                kept.append(f"the same day, {fmt_dates(r['date_from'], r['date_to']).split(' (')[0]} "
+                            "(say a different day to change it)")
             note = (f"Switched to {SERVICE_NAMES[p.service]}: I've dropped the {SERVICE_NAMES[switched_from]} "
-                    "request (nothing was booked)" + (f" and kept your area, {r['area']}" if keep and
-                                                       r.get("area") == keep["area"] else "") + ".")
+                    "request (nothing was booked)" + (" and kept " + " and ".join(kept) if kept else "") + ".")
             r["_note"] = " ".join(x for x in (note, r.get("_note")) if x)
             self.tracer.event("service_switch", **{"from": switched_from}, to=p.service, kept=sorted(keep))
         self._transition("collecting", f"new {p.intent} request")
