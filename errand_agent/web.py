@@ -1,14 +1,17 @@
-"""Local web UI:  python -m errand_agent.web  ->  http://127.0.0.1:8000
+"""HTTP backend for the web test console (web/, React):  python -m errand_agent.web  ->  http://127.0.0.1:8000
 
-Chat on the left; live trace, workflow state, memory and the provider's ground-truth bookings on the right.
-Controls let a tester pick a failure scenario, switch the parser (rule-based / OpenAI), fast-forward the clock
-(e.g. to expire a hold) and kill + restart the agent process to test recovery. Stdlib only.
+JSON API under /api. Every browser tab gets its own isolated session (X-Session-Id header): its own mock provider
+world, memory, clock and trace. If web/dist exists (npm run build), the built frontend is served from / too.
+Stdlib only.
 """
 import argparse
 import json
 import os
 import shutil
+import re
 import threading
+import time
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -18,16 +21,19 @@ from .cli import SCENARIOS, load_dotenv
 from .clock import SystemClock
 from .mock_api import MockProviderAPI, Scenario, SimulatedCrash
 
-STATIC = os.path.join(os.path.dirname(__file__), "static", "index.html")
+DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "dist")
 PLAYBOOKS = os.path.join(os.path.dirname(__file__), "static", "playbooks.json")
 SESSION = "web"
+FIXED_START = datetime(2026, 11, 1, 8, 0)  # same as tests/helpers.py
 
 
 class OffsetClock(SystemClock):
     """Real time plus a tester-controlled offset, so holds can be expired without waiting 10 minutes."""
 
-    def __init__(self):
+    def __init__(self, start: datetime | None = None):
         self.offset = timedelta()
+        if start:
+            self.offset = start - super().now()
 
     def now(self) -> datetime:
         return super().now() + self.offset
@@ -42,7 +48,7 @@ class App:
         self.clock_factory = clock_factory
         self.lock = threading.Lock()
         self.agent = None
-        self.config = {"scenario": "default", "parser": "rules", "user": "u1"}
+        self.config = {"scenario": "default", "parser": "rules", "user": "u1", "clock": "real"}
         self.crashed = False
 
     @property
@@ -83,6 +89,8 @@ class App:
         new = {k: cfg.get(k, v) for k, v in self.config.items()}
         if new["scenario"] not in SCENARIOS or new["parser"] not in ("rules", "openai", "anthropic"):
             raise ValueError("unknown scenario or parser")
+        if new["clock"] not in ("real", "fixed"):
+            raise ValueError("clock must be 'real' or 'fixed'")
         if not str(new["user"]).isalnum():
             raise ValueError("user id must be alphanumeric")
         old = self.config
@@ -94,7 +102,9 @@ class App:
             raise
         shutil.rmtree(self.root, ignore_errors=True)
         os.makedirs(self.data_dir, exist_ok=True)
-        self.clock = self.clock_factory()
+        # "fixed" starts the clock at the same moment the offline tests use, so playbooks behave identically
+        self.clock = OffsetClock(FIXED_START) if new["clock"] == "fixed" and self.clock_factory is OffsetClock \
+            else self.clock_factory()
         self._boot(first=True)
         return {"reply": None}
 
@@ -141,10 +151,64 @@ class App:
             "max_turns": self.agent.limits.max_turns,
             "memory": self.agent.memory.facts, "bookings": bookings,
             "events": events, "next": since + len(events), "scenarios": sorted(SCENARIOS),
+            "parsers": Hub.parsers(),
         }
 
 
-def make_handler(app: App):
+SESSION_ID = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+
+
+class Hub:
+    """One App per browser session, created on first use. Oldest sessions are evicted past max_sessions.
+    LLM-parsed messages are capped per day across all sessions so a public deployment can't run up a bill."""
+
+    def __init__(self, root: str, default_parser: str = "rules", max_sessions: int = 300,
+                 llm_daily_cap: int = int(os.environ.get("LLM_DAILY_CAP", "1500"))):
+        self.root, self.default_parser = root, default_parser
+        self.max_sessions, self.llm_daily_cap = max_sessions, llm_daily_cap
+        self.sessions: OrderedDict = OrderedDict()
+        self.lock = threading.Lock()
+        self.llm_day, self.llm_used = time.strftime("%Y-%m-%d"), 0
+        shutil.rmtree(root, ignore_errors=True)
+
+    def get(self, sid: str | None) -> App:
+        sid = sid or "local"
+        if sid != "local" and not SESSION_ID.match(sid):
+            raise ValueError("bad session id")
+        with self.lock:
+            app = self.sessions.get(sid)
+            if app is None:
+                app = App(os.path.join(self.root, sid))
+                parser = self.default_parser if self.default_parser in self.parsers() else "rules"
+                app.reset({"parser": parser})
+                self.sessions[sid] = app
+                while len(self.sessions) > self.max_sessions:
+                    _, old = self.sessions.popitem(last=False)
+                    shutil.rmtree(old.root, ignore_errors=True)
+            self.sessions.move_to_end(sid)
+            return app
+
+    @staticmethod
+    def parsers():
+        return ["rules"] + [p for p, env in (("openai", "OPENAI_API_KEY"), ("anthropic", "ANTHROPIC_API_KEY"))
+                            if os.environ.get(env)]
+
+    def charge_llm(self) -> bool:
+        with self.lock:
+            today = time.strftime("%Y-%m-%d")
+            if today != self.llm_day:
+                self.llm_day, self.llm_used = today, 0
+            if self.llm_used >= self.llm_daily_cap:
+                return False
+            self.llm_used += 1
+            return True
+
+
+CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css",
+                 ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".json": "application/json"}
+
+
+def make_handler(hub: Hub):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -154,27 +218,55 @@ def make_handler(app: App):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")  # no cookies; sessions are an explicit header
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
 
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Session-Id")
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.end_headers()
+
+        def _static(self, path: str):
+            rel = os.path.normpath(path.split("?", 1)[0].lstrip("/")) or "index.html"
+            full = os.path.join(DIST, rel)
+            if rel.startswith("..") or not os.path.isfile(full):
+                full = os.path.join(DIST, "index.html")  # SPA fallback
+            if not os.path.isfile(full):
+                return self._send(200, b"Backend is running. Build the frontend (cd web && npm run build) or use "
+                                       b"./try_it.sh web.", "text/plain; charset=utf-8")
+            with open(full, "rb") as f:
+                return self._send(200, f.read(), CONTENT_TYPES.get(os.path.splitext(full)[1], "application/octet-stream"))
+
+        def _app(self) -> App:
+            return hub.get(self.headers.get("X-Session-Id"))
+
         def do_GET(self):
-            if self.path in ("/", "/index.html"):
-                with open(STATIC, "rb") as f:
-                    return self._send(200, f.read(), "text/html; charset=utf-8")
-            if self.path == "/playbooks.json":
-                with open(PLAYBOOKS, "rb") as f:
-                    return self._send(200, f.read())
-            if self.path.startswith("/api/state"):
-                since = 0
-                if "since=" in self.path:
-                    try:
-                        since = max(0, int(self.path.split("since=", 1)[1].split("&")[0]))
-                    except ValueError:
-                        pass
-                with app.lock:
-                    return self._send(200, app.snapshot(since))
-            self._send(404, {"error": "not found"})
+            try:
+                if self.path == "/api/health":
+                    return self._send(200, {"ok": True, "sessions": len(hub.sessions)})
+                if self.path in ("/api/playbooks", "/playbooks.json"):
+                    with open(PLAYBOOKS, "rb") as f:
+                        return self._send(200, f.read())
+                if self.path.startswith("/api/state"):
+                    since = 0
+                    if "since=" in self.path:
+                        try:
+                            since = max(0, int(self.path.split("since=", 1)[1].split("&")[0]))
+                        except ValueError:
+                            pass
+                    app = self._app()
+                    with app.lock:
+                        return self._send(200, app.snapshot(since))
+                if self.path.startswith("/api/"):
+                    return self._send(404, {"error": "not found"})
+                return self._static(self.path)
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
 
         def do_POST(self):
             try:
@@ -184,13 +276,19 @@ def make_handler(app: App):
                 body = json.loads(self.rfile.read(n) or b"{}")
                 if not isinstance(body, dict):
                     raise ValueError("JSON object expected")
+                app = self._app()
                 with app.lock:
                     if self.path == "/api/message":
                         text = body.get("text")
                         if not isinstance(text, str):
                             raise ValueError("text must be a string")
+                        if app.config["parser"] != "rules" and not hub.charge_llm():
+                            return self._send(429, {"error": "Today's LLM message budget for this demo is used up. "
+                                                             "Start a new session with the rule-based parser."})
                         out = app.message(text)
                     elif self.path == "/api/reset":
+                        if body.get("parser", "rules") not in hub.parsers():
+                            raise ValueError(f"parser {body.get('parser')!r} is not available on this server")
                         out = app.reset(body)
                     elif self.path == "/api/restart":
                         out = app.restart()
@@ -216,10 +314,9 @@ def main(argv=None):
                     help="start with an LLM parser (can be switched in the UI)")
     a = ap.parse_args(argv)
     load_dotenv()
-    app = App(a.data_dir)
-    app.reset({"parser": a.llm or "rules"})
-    srv = ThreadingHTTPServer((a.host, a.port), make_handler(app))
-    print(f"Errand agent web UI on http://{a.host}:{a.port}  (Ctrl+C to stop)")
+    hub = Hub(a.data_dir, default_parser=a.llm or "rules")
+    srv = ThreadingHTTPServer((a.host, a.port), make_handler(hub))
+    print(f"Errand agent backend on http://{a.host}:{a.port}  (Ctrl+C to stop)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

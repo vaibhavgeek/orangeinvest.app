@@ -3,7 +3,7 @@
 #   ./try_it.sh                 run the tests, open the eval table, then open chat + live trace windows
 #   ./try_it.sh test            only run the tests and open the eval table
 #   ./try_it.sh chat [SCENARIO] only open chat + live trace (default scenario: timeout_after_success)
-#   ./try_it.sh web             web UI with chat, trace, state, memory and red-team playbooks (http://127.0.0.1:8000)
+#   ./try_it.sh web             backend + React test console with red-team playbooks (http://127.0.0.1:5173)
 #   LLM=openai ./try_it.sh chat  parse with OpenAI (key from .env OPENAI_API_KEY; model OPENAI_MODEL, default gpt-6.1-terra)
 # Scenarios: default timeout_after_success timeout_not_booked slot_taken price_change crash_after_book
 set -euo pipefail
@@ -42,9 +42,16 @@ EOF
 }
 
 run_web() {
-  echo "▶ Web UI on http://127.0.0.1:8000  (Ctrl+C to stop)"
-  [[ "$(uname)" == "Darwin" ]] && (sleep 1 && open "http://127.0.0.1:8000") &
-  "$PY" -m errand_agent.web $LLM_FLAG
+  command -v npm >/dev/null || { echo "npm not found: install Node.js 18+ (https://nodejs.org)"; exit 1; }
+  [[ -d web/node_modules ]] || (cd web && npm install --no-audit --no-fund)
+  echo "▶ Backend (Python) on http://127.0.0.1:8000"
+  "$PY" -m errand_agent.web --port 8000 $LLM_FLAG &
+  BACKEND_PID=$!
+  trap 'kill $BACKEND_PID 2>/dev/null' EXIT INT TERM
+  sleep 1
+  echo "▶ Web app (React, Vite) on http://127.0.0.1:5173  (Ctrl+C stops both)"
+  [[ "$(uname)" == "Darwin" ]] && (sleep 2 && open "http://127.0.0.1:5173") &
+  (cd web && npm run dev -- --host 127.0.0.1 --strictPort)
 }
 
 case "$MODE" in

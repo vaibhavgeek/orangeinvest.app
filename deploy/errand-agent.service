@@ -1,0 +1,21 @@
+[Unit]
+Description=Errand Agent backend
+After=network-online.target
+
+[Service]
+User=errand
+WorkingDirectory=/opt/errand-agent
+Environment=TZ=Asia/Kolkata
+Environment=PYTHONUNBUFFERED=1
+# Optional: OPENAI_API_KEY=..., LLM_DAILY_CAP=500 (enables the OpenAI parser in the UI)
+EnvironmentFile=-/etc/errand-agent.env
+ExecStart=/usr/bin/python3 -m errand_agent.web --host 127.0.0.1 --port 8000 --data-dir /var/lib/errand-agent
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/errand-agent
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
