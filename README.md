@@ -5,15 +5,18 @@ won't double-book, it won't act without your approval, and nothing a provider re
 
 Python 3.10+, no runtime dependencies (pytest is only needed to run the tests). It runs fully offline.
 
+**Live test console:** https://main.d2wl4x6lwymmcp.amplifyapp.com (frontend on AWS Amplify, backend on EC2 at
+https://3-111-160-146.sslip.io). Each browser tab gets its own isolated session.
+
 ## Run it (3 commands)
 
 ```bash
 pip install -r requirements.txt                    # just pytest
 pytest                                             # 97 tests: 28 eval scenarios + 32 red-team playbooks + units
-python -m errand_agent.web                         # web UI on http://127.0.0.1:8000 (or: ./try_it.sh web)
+./try_it.sh web                                    # backend :8000 + React console :5173 (needs Node 18+)
 ```
 
-The web UI shows the chat next to the live trace, the workflow state, memory, and the provider's ground-truth
+The web console (React + TypeScript, `web/`) shows the chat next to the live trace, the workflow state, memory, and the provider's ground-truth
 bookings. It has controls to inject failure scenarios, fast-forward the clock (expire holds) and kill/restart the
 process, plus one-click **red-team playbooks**: see [docs/RED_TEAM.md](docs/RED_TEAM.md). A terminal chat is also
 available: `python -m errand_agent.cli --fresh --scenario timeout_after_success`.
@@ -56,7 +59,9 @@ deterministic and is the one the evals use, so `pytest` never calls the network.
 | `errand_agent/state.py`, `trace.py`, `budget.py` | Persisted workflow state, JSONL traces, hard limits |
 | `tests/test_evals.py` | 28 scripted scenarios with invariant checks → `docs/EVAL_RESULTS.md` |
 | `tests/test_units.py` | Guardrail unit tests + regression tests for the 3 bugs |
-| `errand_agent/web.py`, `static/` | Web test console (stdlib `http.server`) and the red-team playbooks |
+| `errand_agent/web.py` | JSON backend for the console (stdlib `http.server`), one isolated session per browser tab |
+| `web/` | React + TypeScript (Vite) test console; `errand_agent/static/playbooks.json` holds the red-team playbooks |
+| `deploy/`, `amplify.yml` | EC2 setup (systemd + Caddy HTTPS) and the Amplify build spec |
 | `errand_agent/redteam.py`, `tests/test_playbooks.py` | Run the playbooks offline → `docs/RED_TEAM_RESULTS.md` |
 | `docs/RED_TEAM.md` | Attacks/edge cases to try, what must happen, what red-teaming fixed |
 | `docs/DESIGN.md` | Design note |
@@ -74,3 +79,13 @@ deterministic and is the one the evals use, so `pytest` never calls the network.
 - **Budget is asked for once.** If the user ignores the question, we search without a cap rather than nagging. Preferences are never asked for; they come from memory or the request.
 - **What gets remembered:** an area mentioned in a request is saved as *stated*, and the agent says so. A time constraint in a request applies to that request only, unless the user says "remember" or "from now on". A provider you booked becomes an *inferred* preference that the agent asks about before using.
 - **"This week"** means today plus 6 days. A weekday name means its next occurrence.
+
+## Deployment
+
+- **Frontend:** AWS Amplify app connected to this repo (`amplify.yml`, app root `web/`). Every push to `main`
+  rebuilds. The build-time env var `VITE_API_URL` points at the backend.
+- **Backend:** Ubuntu 24.04 on EC2 (t4g.small, ap-south-1, Elastic IP). `deploy/setup_ec2.sh` installs the service
+  under systemd and puts Caddy in front for automatic HTTPS on `<ip>.sslip.io`. To update after a push:
+  `ssh ubuntu@<ip> 'sudo DOMAIN=3-111-160-146.sslip.io bash /opt/errand-agent/deploy/setup_ec2.sh'`.
+- The OpenAI parser is enabled on the server through `/etc/errand-agent.env`, which is never committed. LLM messages are
+  capped per day (`LLM_DAILY_CAP`). The rule-based parser is the default.

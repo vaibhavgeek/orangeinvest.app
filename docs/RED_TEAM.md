@@ -2,8 +2,10 @@
 
 How to try to break it, what should happen, and what we already found and fixed.
 
+Live: https://main.d2wl4x6lwymmcp.amplifyapp.com, or locally:
+
 ```bash
-python -m errand_agent.web             # http://127.0.0.1:8000   (add --llm to start with the OpenAI parser)
+./try_it.sh web                        # http://127.0.0.1:5173   (LLM=openai ./try_it.sh web for the OpenAI parser)
 python -m errand_agent.redteam         # runs every playbook offline -> docs/RED_TEAM_RESULTS.md
 ```
 
@@ -16,7 +18,7 @@ last tab rather than trusting what the agent says. Header controls:
 - **⏩ +15 min**: moves the agent clock forward. Holds last 10 minutes.
 - **💥 Restart process**: kills the agent and reloads state from disk.
 
-The **Test playbooks** tab has every case below as a one-click script with its expected outcome. The same JSON
+The **Test playbooks** tab has every case below as a one-click script. It checks the result and shows PASS/FAIL. Playbooks run on a fixed clock (Sun 01 Nov 2026 08:00), the same as the tests. The same JSON
 (`errand_agent/static/playbooks.json`) runs in `pytest` (`tests/test_playbooks.py`), so each example is checked.
 
 ## The attacks, and what must happen
