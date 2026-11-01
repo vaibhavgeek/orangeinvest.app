@@ -43,6 +43,10 @@ export type Snapshot = {
   events: TraceEvent[];
   next: number;
   scenarios: string[];
+  user?: string;
+  chat?: number;
+  expires_in?: number | null;
+  ttl?: number;
 };
 
 export type Reply = { reply: string | null; system?: boolean };
@@ -59,19 +63,86 @@ export type Playbook = {
 };
 
 const BASE = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "") ?? "";
+const KEY = "errand-token";
+const UNREACHABLE = `Can't reach the backend${BASE ? ` at ${BASE}` : ""}. Is it running?`;
 
-// One isolated backend session per browser tab: its own mock provider, memory, clock and trace.
-function sessionId(): string {
-  let id = sessionStorage.getItem("errand-session");
-  if (!id) {
-    id = crypto.randomUUID();
-    sessionStorage.setItem("errand-session", id);
+type Stored = { token: string; user: string; deadline: number };
+
+/** An anonymous user lasts 15 minutes. The signed token (user id + expiry, HMAC'd by the server) is kept in
+ * localStorage, so a reload or New chat keeps the same user until it runs out. */
+function stored(): Stored | null {
+  try {
+    const s = JSON.parse(localStorage.getItem(KEY) || "null") as Stored | null;
+    return s && s.token && s.deadline > Date.now() ? s : null;
+  } catch {
+    return null;
   }
-  return id;
 }
 
+export function sessionInfo(): Stored | null { return stored(); }
+
+/** Correct the local countdown from the server's remaining seconds. */
+export function syncDeadline(expiresIn: number | null | undefined) {
+  const s = stored();
+  if (s && typeof expiresIn === "number") {
+    s.deadline = Date.now() + expiresIn * 1000;
+    localStorage.setItem(KEY, JSON.stringify(s));
+  }
+}
+
+export function dropSession() { localStorage.removeItem(KEY); }
+
+/** Store a token the server re-issued (New chat: same user, fresh 15 minutes). Returns the new deadline. */
+export function adoptSession(j: { token: string; user: string; expires_in: number }): number {
+  const s: Stored = { token: j.token, user: j.user, deadline: Date.now() + j.expires_in * 1000 };
+  localStorage.setItem(KEY, JSON.stringify(s));
+  return s.deadline;
+}
+
+const ACCESS = "errand-access";
+
+/** The server wants the password (no access pass yet, or it ran out). */
+export class NeedPassword extends Error {}
+
+let issuing: Promise<Stored> | null = null;
+
+/** Ask the server for a brand-new anonymous user. The first time this needs the password; the server then hands
+ * back an access pass so later 15-minute users don't ask again for a day. */
+export function newUser(password?: string): Promise<Stored> {
+  issuing ??= (async () => {
+    try {
+      let r: Response;
+      try {
+        r = await fetch(BASE + "/api/session", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ access: localStorage.getItem(ACCESS) ?? undefined, password }),
+        });
+      } catch {
+        throw new Error(UNREACHABLE);
+      }
+      const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+      if (r.status === 401 && j.password) {
+        localStorage.removeItem(ACCESS);
+        throw new NeedPassword(password ? j.error || "Wrong password." : "");
+      }
+      if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+      if (j.access) localStorage.setItem(ACCESS, j.access);
+      const s: Stored = { token: j.token, user: j.user, deadline: Date.now() + j.expires_in * 1000 };
+      localStorage.setItem(KEY, JSON.stringify(s));
+      return s;
+    } finally {
+      issuing = null;
+    }
+  })();
+  return issuing;
+}
+
+/** Thrown when the server rejects the token (expired, forged or missing). */
+export class SessionEnded extends Error {}
+
 export async function api<T>(path: string, body?: unknown): Promise<T> {
-  const init: RequestInit = { headers: { "X-Session-Id": sessionId() } };
+  const s = stored() ?? (await newUser());
+  const init: RequestInit = { headers: { Authorization: `Bearer ${s.token}` } };
   if (body !== undefined) {
     init.method = "POST";
     init.headers = { ...init.headers, "Content-Type": "application/json" };
@@ -81,9 +152,13 @@ export async function api<T>(path: string, body?: unknown): Promise<T> {
   try {
     r = await fetch(BASE + path, init);
   } catch {
-    throw new Error(`Can't reach the backend${BASE ? ` at ${BASE}` : ""}. Is it running?`);
+    throw new Error(UNREACHABLE);
   }
   const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+  if (r.status === 401 && j.expired) {
+    if (stored()?.token === s.token) dropSession();
+    throw new SessionEnded(j.error || "Your session ended.");
+  }
   if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
   return j as T;
 }

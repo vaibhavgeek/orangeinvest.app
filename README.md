@@ -6,7 +6,8 @@ won't double-book, it won't act without your approval, and nothing a provider re
 Python 3.10+, no runtime dependencies (pytest is only needed to run the tests). It runs fully offline.
 
 **Live test console:** https://main.d2wl4x6lwymmcp.amplifyapp.com (frontend on AWS Amplify, backend on EC2 at
-https://3-111-160-146.sslip.io). Each browser tab gets its own isolated session.
+https://3-111-160-146.sslip.io). Password: `VAIBHAV IS ORANGE` (hardcoded in `errand_agent/web.py`). Each visitor
+then gets an anonymous user that lasts 15 minutes.
 
 ## Run it (3 commands)
 
@@ -64,7 +65,7 @@ on a full run to drop unused recordings).
 | `errand_agent/state.py`, `trace.py`, `budget.py` | Persisted workflow state, JSONL traces, hard limits |
 | `tests/test_evals.py` | 28 scripted scenarios with invariant checks → `docs/EVAL_RESULTS.md` |
 | `tests/test_units.py` | Guardrail unit tests + regression tests for the 3 bugs |
-| `errand_agent/web.py` | JSON backend for the console (stdlib `http.server`), one isolated session per browser tab |
+| `errand_agent/web.py` | JSON backend for the console (stdlib `http.server`). Each visitor is an anonymous user with an HMAC-signed token that lasts 15 minutes (`SESSION_TTL_SECONDS`); New chat keeps that user's bookings and memory and restarts the 15 minutes; at expiry the user and their data are deleted |
 | `web/` | React + TypeScript (Vite) test console; `errand_agent/static/playbooks.json` holds the red-team playbooks |
 | `deploy/`, `amplify.yml` | EC2 setup (systemd + Caddy HTTPS) and the Amplify build spec |
 | `errand_agent/redteam.py`, `tests/test_playbooks.py` | Run the playbooks offline → `docs/RED_TEAM_RESULTS.md` |

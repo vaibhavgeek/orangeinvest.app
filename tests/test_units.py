@@ -325,3 +325,46 @@ def test_input_guards(tmp_path):
     assert "only book in Bangalore" in w.say("my area is Mars")[0] and not w.agent.memory.active()
     w.say(PLUMBER_REQ)
     assert "dropped that request" in w.say("cancel that")[0] and w.agent.state["stage"] == "idle"
+
+
+def test_session_tokens_reject_forged_and_expired():
+    from errand_agent.web import AuthError, Tokens
+    now = [1_000_000.0]
+    t = Tokens(ttl=900, secret=b"k" * 32, now=lambda: now[0])
+    s = t.issue()
+    assert t.verify(s["token"]) == (s["user"], 1_000_900)
+    user, exp, sig = s["token"].split(".")
+    for bad in (None, "", "garbage", f"{user}.{int(exp) + 9999}.{sig}", f"u0000000000.{exp}.{sig}",
+                Tokens(ttl=900, secret=b"x" * 32, now=lambda: now[0]).issue()["token"]):
+        with pytest.raises(AuthError):
+            t.verify(bad)
+    now[0] += 900
+    with pytest.raises(AuthError) as e:
+        t.verify(s["token"])
+    assert e.value.reason == "expired"
+
+
+def test_new_chat_keeps_the_user_and_their_bookings(tmp_path):
+    from errand_agent.cassette import replay_model
+    from errand_agent.web import App
+    app = App(str(tmp_path), clock_factory=FakeClock, model_factory=replay_model, phrase_replies=False, user="uabc")
+    app.reset({"user": "attacker"})
+    assert app.config["user"] == "uabc"
+    before = app.snapshot(0)["bookings"]
+    app.new_chat()
+    snap = app.snapshot(0)
+    assert snap["chat"] == 2 and snap["bookings"] == before and app.agent.state["session_id"] == "chat2"
+
+
+def test_new_session_needs_the_password_or_an_access_pass(tmp_path):
+    from errand_agent.web import PASSWORD, AuthError, Hub
+    hub = Hub(str(tmp_path))
+    for body in ({}, {"password": "orange"}, {"access": "access.9999999999.forged"}):
+        with pytest.raises(AuthError):
+            hub.issue(body)
+    first = hub.issue({"password": PASSWORD})
+    assert hub.tokens.verify(first["token"])[0] == first["user"]
+    again = hub.issue({"access": first["access"]})  # later 15-minute users don't need the password again
+    assert again["user"] != first["user"]
+    with pytest.raises(AuthError):
+        hub.tokens.verify(first["access"])  # an access pass is never a session token

@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type Approval, type Playbook, type Reply, type Snapshot, type TraceEvent } from "./api";
+import {
+  adoptSession, api, type Approval, dropSession, NeedPassword, newUser, type Playbook, type Reply, SessionEnded,
+  sessionInfo, type Snapshot, syncDeadline, type TraceEvent,
+} from "./api";
 import {
   type Active, BookingsPane, expandSteps, expectText, MemoryPane, PlaybooksPane, ProfilePane, StatePane, TracePane, verdict,
 } from "./panels";
@@ -18,6 +21,11 @@ const EXAMPLES = [
 ];
 
 let msgId = 0;
+const ENDED = "⏱ Your 15-minute session ended. That user, with their bookings, memory and chat, has been deleted. "
+  + "Start a new session to continue as a brand-new user.";
+const mmss = (sec: number) => `${String(Math.floor(sec / 60)).padStart(2, "0")}:${String(sec % 60).padStart(2, "0")}`;
+type Theme = "light" | "dark";
+const currentTheme = (): Theme => (document.documentElement.dataset.theme === "light" ? "light" : "dark");
 const fmtDay = (s: string) =>
   new Date(s).toLocaleDateString("en-IN", { weekday: "short", day: "2-digit", month: "short", year: "numeric" });
 const fmtTime = (s: string) =>
@@ -62,11 +70,23 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [playbooks, setPlaybooks] = useState<Playbook[]>([]);
   const [active, setActiveState] = useState<Active | null>(null);
-  const [form, setForm] = useState({ scenario: "default", user: "u1", clock: "real" });
+  const [form, setForm] = useState({ scenario: "default", clock: "real" });
+  const [ended, setEndedState] = useState(false);
+  const [left, setLeft] = useState<number | null>(null);
+  const [who, setWho] = useState<string | null>(null);
+  const [theme, setTheme] = useState<Theme>(currentTheme);
+  const [locked, setLockedState] = useState(false);
+  const [pw, setPw] = useState("");
+  const [pwError, setPwError] = useState("");
+  const lockedRef = useRef(false);
+  const setLocked = (b: boolean) => { lockedRef.current = b; setLockedState(b); };
 
   const since = useRef(0);
   const generation = useRef(0); // bumps on every new session, so stale polls are discarded
   const busyRef = useRef(false);
+  const endedRef = useRef(false);
+  const hadSnap = useRef(false);
+  const deadline = useRef<number | null>(null);
   const activeRef = useRef<Active | null>(null);
   const chatRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -77,85 +97,180 @@ export default function App() {
   const say = (kind: Msg["kind"], text: string) => setMsgs((m) => [...m, { id: ++msgId, kind, text }]);
   const showToast = (t: string) => { setToast(t); window.setTimeout(() => setToast((x) => (x === t ? null : x)), 6000); };
 
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("errand-theme", theme);
+  }, [theme]);
+
+  /** The 15 minutes are up (or the server refused the token): drop everything on screen, including any pending
+   * confirmation, and lock the chat until a new session is started. */
+  const endSession = useCallback(() => {
+    if (endedRef.current) return;
+    endedRef.current = true;
+    setEndedState(true);
+    generation.current++;
+    dropSession();
+    activeRef.current = null;
+    setActiveState(null);
+    since.current = 0;
+    setEvents([]);
+    setSnap(null);
+    setLeft(0);
+    setMsgs([{ id: ++msgId, kind: "system", text: ENDED }]);
+  }, []);
+
+  const fail = (e: unknown) => {
+    if (e instanceof SessionEnded) endSession();
+    else if (e instanceof NeedPassword) setLocked(true);
+    else showToast((e as Error).message);
+  };
+
   // Serialised so overlapping polls never append the same trace rows twice.
   const refresh = useCallback((): Promise<Snapshot | null> => {
     refreshChain.current = refreshChain.current.then(async () => {
+      if (endedRef.current || lockedRef.current) return null; // a poll must never silently create the next user
       const gen = generation.current;
       try {
         const s = await api<Snapshot>(`/api/state?since=${since.current}`);
         if (gen !== generation.current) return null;
+        hadSnap.current = true;
+        syncDeadline(s.expires_in);
+        deadline.current = sessionInfo()?.deadline ?? Date.now() + (s.expires_in ?? 0) * 1000;
+        setWho(s.user ?? null);
         since.current = s.next;
         if (s.events.length) setEvents((ev) => [...ev, ...s.events]);
         setSnap(s);
         return s;
-      } catch {
+      } catch (e) {
+        if (e instanceof NeedPassword) setLocked(true);
+        else if (e instanceof SessionEnded && hadSnap.current && gen === generation.current) endSession();
         return null;
       }
     });
     return refreshChain.current;
-  }, []);
+  }, [endSession]);
 
   const booted = useRef(false);
   useEffect(() => {
     if (booted.current) return;
     booted.current = true;
     if (DEV) api<Playbook[]>("/api/playbooks").then(setPlaybooks).catch((e) => showToast(e.message));
-    refresh().then((s) => {
-      if (s) setForm(s.config);
-      else say("system", "Can't reach the backend right now. Please try again in a moment.");
+    // A token the server no longer accepts (e.g. it restarted) is replaced quietly on first load.
+    refresh().then((s) => s ?? (sessionInfo() || lockedRef.current ? null : refresh())).then((s) => {
+      if (s) setForm({ scenario: s.config.scenario, clock: s.config.clock });
+      else if (!lockedRef.current) say("system", "Can't reach the backend right now. Please try again in a moment.");
     });
     window.setInterval(() => { if (!busyRef.current) refresh(); }, 2500);
   }, [refresh]);
 
+  // The countdown runs on the browser clock (corrected by every poll); at 00:00 the user is gone.
+  useEffect(() => {
+    const t = window.setInterval(() => {
+      if (endedRef.current || deadline.current === null) return;
+      const sec = Math.max(0, Math.ceil((deadline.current - Date.now()) / 1000));
+      setLeft(sec);
+      if (sec === 0) endSession();
+    }, 250);
+    return () => window.clearInterval(t);
+  }, [endSession]);
+
   useEffect(() => { chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight }); }, [msgs, busy, snap?.stage]);
 
   async function send(text: string, shown?: string): Promise<string | null> {
-    if (busyRef.current || !text.trim()) return null;
+    if (busyRef.current || endedRef.current || !text.trim()) return null;
     const echo = shown ?? text;
     say("user", echo.length > 400 ? `${echo.slice(0, 400)}… (${echo.length} chars)` : echo);
     setBusyBoth(true);
+    const gen = generation.current;
     let reply: string | null = null;
     try {
       const r = await api<Reply>("/api/message", { text });
       reply = r.reply;
-      if (r.reply) say(r.system ? "system" : "agent", r.reply);
-    } catch (e) { showToast((e as Error).message); }
+      if (r.reply && gen === generation.current) say(r.system ? "system" : "agent", r.reply);
+    } catch (e) { fail(e); }
     setBusyBoth(false);
     await refresh();
     return reply;
   }
 
   async function control(path: string, body: object = {}): Promise<string | null> {
-    if (busyRef.current) return null;
+    if (busyRef.current || endedRef.current) return null;
     setBusyBoth(true);
+    const gen = generation.current;
     let reply: string | null = null;
     try {
       const r = await api<Reply>(path, body);
       reply = r.reply;
-      if (r.reply) say(r.system ? "system" : "agent", r.reply);
-    } catch (e) { showToast((e as Error).message); }
+      if (r.reply && gen === generation.current) say(r.system ? "system" : "agent", r.reply);
+    } catch (e) { fail(e); }
     setBusyBoth(false);
     await refresh();
     return reply;
   }
 
-  async function newSession(over: Partial<typeof form> = {}): Promise<boolean> {
-    if (busyRef.current) return false;
-    const cfg = { ...form, ...over, user: (over.user ?? form.user).trim() || "u1" };
-    setBusyBoth(true);
-    try {
-      await api("/api/reset", cfg);
-    } catch (e) { showToast((e as Error).message); setBusyBoth(false); return false; }
+  function clearScreen() {
     generation.current++;
     since.current = 0;
     setEvents([]);
     setMsgs([]);
+  }
+
+  /** Full wipe of this user's data with a chosen scenario and clock (playbooks / dev only). */
+  async function newSession(over: Partial<typeof form> = {}): Promise<boolean> {
+    if (busyRef.current || endedRef.current) return false;
+    const cfg = { ...form, ...over };
+    setBusyBoth(true);
+    try {
+      await api("/api/reset", cfg);
+    } catch (e) { fail(e); setBusyBoth(false); return false; }
+    clearScreen();
     setForm(cfg);
-    if (DEV) say("system", `New session · scenario “${cfg.scenario}” · user ${cfg.user}`
+    if (DEV) say("system", `New session · scenario “${cfg.scenario}” · user ${who ?? "?"}`
       + `${cfg.clock === "fixed" ? " · clock fixed at Sun 01 Nov 2026 08:00" : ""}.`);
     setBusyBoth(false);
     await refresh();
     return true;
+  }
+
+  /** A fresh conversation for the same user: bookings and memory stay, so earlier bookings can be moved.
+   * The server re-issues the token, so the countdown restarts at 15:00. */
+  async function newChat() {
+    if (endedRef.current) return startFresh();
+    if (busyRef.current) return;
+    setActive(null);
+    setBusyBoth(true);
+    try {
+      const r = await api<{ token: string; user: string; expires_in: number }>("/api/chat/new", {});
+      deadline.current = adoptSession(r);
+      setLeft(r.expires_in);
+      clearScreen();
+    } catch (e) { fail(e); }
+    setBusyBoth(false);
+    await refresh();
+  }
+
+  /** After the 15 minutes: a brand-new anonymous user with an empty world. */
+  async function startFresh(password?: string) {
+    if (busyRef.current) return;
+    setBusyBoth(true);
+    try {
+      await newUser(password);
+    } catch (e) {
+      setBusyBoth(false);
+      if (e instanceof NeedPassword) { setLocked(true); setPwError(e.message); return; }
+      showToast((e as Error).message);
+      return;
+    }
+    setLocked(false);
+    setPw("");
+    setPwError("");
+    clearScreen();
+    hadSnap.current = false;
+    deadline.current = null;
+    endedRef.current = false;
+    setEndedState(false);
+    setBusyBoth(false);
+    await refresh();
   }
 
   async function stepPlaybook() {
@@ -203,17 +318,37 @@ export default function App() {
   const pendingApproval = snap && !snap.crashed && snap.stage === "awaiting_approval" && snap.approval?.status === "pending"
     ? snap.approval : null;
   const lastAgent = [...msgs].reverse().find((m) => m.kind === "agent");
-  const closed = !!snap?.closed;
+  const closed = !!snap?.closed || ended;
   const live = !!snap && !snap.crashed && !closed && !busy && ["choosing", "collecting"].includes(snap.stage);
   // Tables and numbered lists have their own clickable options; anything else in "choosing" gets chips here.
   const choices = snap && !snap.crashed && snap.stage === "choosing" && !(lastAgent && hasOptions(lastAgent.text))
     ? Array.from({ length: Math.min(snap.options, 20) }, (_, i) => String(i + 1)) : [];
+  const timerClass = ended || left === 0 ? "out" : left !== null && left <= 60 ? "low" : "";
+
+  if (locked) {
+    return (
+      <div className="gate">
+        <form className="gatecard" onSubmit={(e) => { e.preventDefault(); if (pw.trim()) startFresh(pw); }}>
+          <h1>🧰 Errand Agent</h1>
+          <div className="muted">This demo is password-protected.</div>
+          <input type="password" autoFocus placeholder="Password" value={pw} disabled={busy}
+                 onChange={(e) => { setPw(e.target.value); setPwError(""); }} />
+          {pwError && <div className="gateerr">{pwError}</div>}
+          <button className="primary" type="submit" disabled={busy || !pw.trim()}>{busy ? "Checking…" : "Enter"}</button>
+        </form>
+      </div>
+    );
+  }
 
   return (
     <>
       <header>
         <h1>🧰 Errand Agent</h1>
         <span className="city" title="The only city for now">📍 Bangalore</span>
+        <span className={"pill timer " + timerClass}
+              title="Each anonymous user lasts 15 minutes. New chat keeps the same user and restarts the 15 minutes; at 00:00 you become a new user.">
+          ⏱ <b>{left === null ? "--:--" : mmss(left)}</b>{who && !ended && <> · <span className="mono">{who.slice(0, 7)}</span></>}
+        </span>
         {DEV && <>
           <span className={"pill stage-" + (snap?.crashed ? "crashed" : snap?.stage ?? "idle")}>
             {snap?.crashed ? "💥 process dead" : snap?.stage ?? "…"}</span>
@@ -223,12 +358,15 @@ export default function App() {
               {(snap?.scenarios ?? [form.scenario]).map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
           </label>
-          <label>User <input type="text" size={4} value={form.user} onChange={(e) => setForm({ ...form, user: e.target.value })} /></label>
-          <button disabled={busy} onClick={() => control("/api/advance", { minutes: 15 })}>⏩ +15 min</button>
-          <button className="danger" disabled={busy} onClick={() => control("/api/restart")}>💥 Restart process</button>
+          <button disabled={busy || ended} onClick={() => newSession()}>Apply scenario</button>
+          <button disabled={busy || ended} onClick={() => control("/api/advance", { minutes: 15 })}>⏩ +15 min</button>
+          <button className="danger" disabled={busy || ended} onClick={() => control("/api/restart")}>💥 Restart process</button>
         </>}
         <span className="spacer" />
-        <button disabled={busy} onClick={() => { setActive(null); newSession({ clock: "real" }); }}>New chat</button>
+        <button className="theme" title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+                aria-label="Toggle dark mode" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
+          {theme === "dark" ? "☀️" : "🌙"}</button>
+        <button disabled={busy} onClick={() => newChat()}>{ended ? "New session" : "New chat"}</button>
         <button className={panel === "profile" ? "on" : ""} onClick={() => toggle("profile")}>Profile</button>
         <button className={panel === "details" ? "on" : ""} onClick={() => toggle("details")}>
           Details {panel === "details" ? "▸" : "◂"}</button>
@@ -262,15 +400,16 @@ export default function App() {
           {(choices.length > 0 || snap?.crashed || closed) && (
             <div className="quick">
               {snap?.crashed && <button className="danger" disabled={busy} onClick={() => control("/api/restart")}>Restart process</button>}
-              {closed && <button className="primary" disabled={busy}
-                                 onClick={() => { setActive(null); newSession({ clock: "real" }); }}>Start a New chat</button>}
+              {ended && <button className="primary" disabled={busy} onClick={() => startFresh()}>Start a new session</button>}
+              {closed && !ended && <button className="primary" disabled={busy} onClick={() => newChat()}>Start a New chat</button>}
               {choices.map((c) => <button key={c} disabled={busy} onClick={() => pick(c)}>
                 {snap?.option_labels?.[Number(c) - 1] ?? `Option ${c}`}</button>)}
             </div>
           )}
           <div className="composer">
             <textarea ref={inputRef} value={input} autoFocus disabled={closed}
-                      placeholder={closed ? "This chat is closed. Start a New chat to book a service." : "Type a message…"}
+                      placeholder={ended ? "Your 15-minute session ended. Start a new session to continue."
+                        : closed ? "This chat is closed. Start a New chat to book a service." : "Type a message…"}
                       onChange={(e) => setInput(e.target.value)}
                       onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } }} />
             <button className="primary" disabled={busy || closed || !input.trim()} onClick={submit}>Send</button>
