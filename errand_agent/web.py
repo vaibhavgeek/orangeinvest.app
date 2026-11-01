@@ -314,7 +314,7 @@ def main(argv=None):
                     help="start with an LLM parser (can be switched in the UI)")
     a = ap.parse_args(argv)
     load_dotenv()
-    hub = Hub(a.data_dir, default_parser=a.llm or "rules")
+    hub = Hub(a.data_dir, default_parser=a.llm or ("openai" if os.environ.get("OPENAI_API_KEY") else "rules"))
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(hub))
     print(f"Errand agent backend on http://{a.host}:{a.port}  (Ctrl+C to stop)")
     try:
